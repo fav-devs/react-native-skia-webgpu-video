@@ -5,6 +5,7 @@
 #import "AudioCompositionUtils.h"
 #import "RNSVJSIUtils.h"
 #include "RNSVCheckedSizes.h"
+#include "Shuttle.h"
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
 
@@ -46,6 +47,7 @@ VideoCompositionFramesExtractorHostObject::getPropertyNames(jsi::Runtime& rt) {
   result.push_back(jsi::PropNameID::forUtf8(rt, std::string("framesVersion")));
   result.push_back(jsi::PropNameID::forUtf8(rt, std::string("isLooping")));
   result.push_back(jsi::PropNameID::forUtf8(rt, std::string("isPlaying")));
+  result.push_back(jsi::PropNameID::forUtf8(rt, std::string("playbackRate")));
   return result;
 }
 
@@ -199,6 +201,8 @@ jsi::Value VideoCompositionFramesExtractorHostObject::get(
     return jsi::Value(!released.test() && isLooping);
   } else if (propName == "isPlaying") {
     return jsi::Value(!released.test() && isPlaying);
+  } else if (propName == "playbackRate") {
+    return jsi::Value(playbackRate);
   }
   return jsi::Value::undefined();
   }
@@ -215,6 +219,16 @@ void VideoCompositionFramesExtractorHostObject::set(
   auto propName = propNameId.utf8(runtime);
   if (propName == "isLooping") {
     isLooping = value.asBool();
+  } else if (propName == "playbackRate") {
+    if (!value.isNumber())
+      throw jsi::JSError(runtime, "playbackRate expects a number");
+    double rate;
+    try {
+      rate = checkedShuttleRate(value.asNumber());
+    } catch (const std::invalid_argument& error) {
+      throw jsi::JSError(runtime, error.what());
+    }
+    setPlaybackRate(rate);
   }
 }
 
@@ -284,20 +298,31 @@ void VideoCompositionFramesExtractorHostObject::decodeTick() {
   std::vector<std::shared_ptr<VideoCompositionItemDecoder>> closing;
   CMTime currentTime = kCMTimeZero;
   uint64_t generation = 0;
+  bool backward = false;
+  double rate = 1;
   @synchronized(self->lock) {
     if (self->released.test() || !self->initialized) {
       return;
     }
     currentTime = self->getCurrentTime();
-    if (CMTimeGetSeconds(currentTime) >= self->composition->duration) {
+    if (self->isPlaying &&
+        Shuttle::reachedStart(CMTimeGetSeconds(currentTime), self->playbackRate)) {
+      // Backward to the start: stopped there, on its first frame, which the
+      // decoders read forward again below. Not a completion.
+      self->pausePosition = kCMTimeZero;
+      self->isPlaying = false;
+      self->framesTime = kCMTimeInvalid;
+      currentTime = kCMTimeZero;
+    } else if (CMTimeGetSeconds(currentTime) >= self->composition->duration &&
+               !(self->isPlaying && self->playbackRate < 0)) {
       if (!self->completeEmitted) {
         self->completeEmitted = true;
         self->emit("complete", jsi::Value::null());
       }
       if (self->isLooping) {
         currentTime = kCMTimeZero;
-        self->startDate = [NSDate date];
-        if (self->audioPlayer) {
+        self->anchorClock(0);
+        if (self->audioPlayer && self->audioIsClock) {
           [self->audioPlayer seekToTime:kCMTimeZero
                   toleranceBefore:kCMTimeZero
                    toleranceAfter:kCMTimeZero
@@ -319,7 +344,11 @@ void VideoCompositionFramesExtractorHostObject::decodeTick() {
       self->completeEmitted = false;
     }
     generation = self->seekGeneration;
-    self->updateWindow(currentTime, opening, closing);
+    backward = self->isPlaying &&
+               Shuttle::backwardAt(self->playbackRate, self->decodeBackward);
+    self->decodeBackward = backward;
+    rate = self->isPlaying ? self->playbackRate : 1;
+    self->updateWindow(currentTime, opening, closing, backward, std::fabs(rate));
   }
   // Readers are slow to open and close: not while the UI thread waits
   // on the self->lock for its frames.
@@ -338,6 +367,7 @@ void VideoCompositionFramesExtractorHostObject::decodeTick() {
     // is nothing to decode until the position moves or a seek lands.
     if (!self->isPlaying && opening.empty() &&
         generation == self->lastAdvancedGeneration &&
+        backward == self->lastAdvancedBackward &&
         CMTimeCompare(currentTime, self->lastAdvancedTime) == 0) {
       return;
     }
@@ -355,7 +385,7 @@ void VideoCompositionFramesExtractorHostObject::decodeTick() {
   dispatch_apply(advancing.size(), DISPATCH_APPLY_AUTO, ^(size_t i) {
     try {
       if (applySeek) advancing[i]->seekTo(currentTime);
-      advancing[i]->advanceDecoder(currentTime);
+      advancing[i]->advanceDecoder(currentTime, backward, rate);
     }
     catch (const std::exception& error) {
       std::lock_guard<std::mutex> guard(failure->mutex);
@@ -381,6 +411,7 @@ void VideoCompositionFramesExtractorHostObject::decodeTick() {
       if (failure->message.empty()) {
         lastAdvancedTime = currentTime;
         lastAdvancedGeneration = generation;
+        lastAdvancedBackward = backward;
       }
     }
   }
@@ -463,13 +494,18 @@ void VideoCompositionFramesExtractorHostObject::init() {
 void VideoCompositionFramesExtractorHostObject::play() {
   @synchronized(lock) {
   if (released.test() || isPlaying) return;
+  // Backward from the start: nothing to play.
+  if (Shuttle::reachedStart(CMTimeGetSeconds(pausePosition), playbackRate)) return;
   framesTime = kCMTimeInvalid;
   // A completed paused clock stays at the end until play explicitly restarts
   // it. Rewind the readers through the same serial seek generation as seekTo.
-  if (CMTimeGetSeconds(pausePosition) >= composition->duration) {
+  // Backward, it plays from the end.
+  if (CMTimeGetSeconds(pausePosition) >= composition->duration &&
+      playbackRate >= 0) {
     seekTo(kCMTimeZero);
   }
-  if (audioPlayer) {
+  audioIsClock = playbackRate == 1;
+  if (audioPlayer && audioIsClock) {
     if (CMTimeGetSeconds(audioPlayer.currentTime) >= composition->duration) {
       [audioPlayer seekToTime:kCMTimeZero
               toleranceBefore:kCMTimeZero
@@ -477,8 +513,7 @@ void VideoCompositionFramesExtractorHostObject::play() {
     }
     [audioPlayer play];
   }
-  startDate =
-      [NSDate dateWithTimeIntervalSinceNow:-CMTimeGetSeconds(pausePosition)];
+  anchorClock(CMTimeGetSeconds(pausePosition));
   pausePosition = kCMTimeZero;
   isPlaying = true;
   }
@@ -498,13 +533,45 @@ void VideoCompositionFramesExtractorHostObject::pause() {
   }
 }
 
+void VideoCompositionFramesExtractorHostObject::anchorClock(double time) {
+  clockAnchor = time;
+  clockAnchorHost = CACurrentMediaTime();
+}
+
+// The clock goes on from where it is at the new rate, without a seek: the
+// decoders keep reading, and only start over (decodeTick) when the direction
+// changes. The audio only plays at 1×.
+void VideoCompositionFramesExtractorHostObject::setPlaybackRate(double rate) {
+  @synchronized(lock) {
+    if (released.test() || rate == playbackRate) return;
+    double previous = playbackRate;
+    if (isPlaying) {
+      anchorClock(CMTimeGetSeconds(getCurrentTime()));
+      framesTime = kCMTimeInvalid;
+    }
+    playbackRate = rate;
+    if (audioPlayer && isPlaying) {
+      if (previous == 1) {
+        audioIsClock = false;
+        [audioPlayer pause];
+      } else if (rate == 1) {
+        [audioPlayer seekToTime:CMTimeMakeWithSeconds(clockAnchor, NSEC_PER_SEC)
+                toleranceBefore:kCMTimeZero
+                 toleranceAfter:kCMTimeZero];
+        [audioPlayer play];
+      }
+    }
+  }
+  scheduleDecode();
+}
+
 void VideoCompositionFramesExtractorHostObject::seekTo(CMTime time) {
   @synchronized(lock) {
   if (released.test()) return;
   seekPending = true;
   framesTime = kCMTimeInvalid;
   if (isPlaying) {
-    startDate = [NSDate dateWithTimeIntervalSinceNow:-CMTimeGetSeconds(time)];
+    anchorClock(CMTimeGetSeconds(time));
   } else {
     pausePosition = time;
   }
@@ -512,6 +579,12 @@ void VideoCompositionFramesExtractorHostObject::seekTo(CMTime time) {
     [audioPlayer seekToTime:time
             toleranceBefore:kCMTimeZero
              toleranceAfter:kCMTimeZero];
+    // Back at 1× since play: the audio is sought to the clock with it, and is
+    // the clock again.
+    if (isPlaying && playbackRate == 1 && !audioIsClock) {
+      audioIsClock = true;
+      [audioPlayer play];
+    }
   }
     seekGeneration++;
     // Reader mutation is applied by decodeTick on its serial queue.
@@ -530,7 +603,8 @@ bool VideoCompositionFramesExtractorHostObject::opensAt(
 // caller; opened ones are made by openDecoders.
 void VideoCompositionFramesExtractorHostObject::updateWindow(
     CMTime time, std::vector<std::shared_ptr<VideoCompositionItem>>& opening,
-    std::vector<std::shared_ptr<VideoCompositionItemDecoder>>& closing) {
+    std::vector<std::shared_ptr<VideoCompositionItemDecoder>>& closing,
+    bool backward, double speed) {
   if (!window.isLazy()) {
     return;
   }
@@ -545,14 +619,14 @@ void VideoCompositionFramesExtractorHostObject::updateWindow(
     if (it == itemDecoders.end()) {
       if (!failedItems.count(item->id) &&
           window.opens(start, end, position, composition->duration,
-                       isLooping)) {
+                       isLooping, backward, speed)) {
 #if defined(RNSV_TRACE_LIFECYCLE) && RNSV_TRACE_LIFECYCLE
         NSLog(@"[rnskv] open %s at %.3fs", item->id.c_str(), position);
 #endif
         opening.push_back(item);
       }
     } else if (!window.keeps(start, end, position, composition->duration,
-                             isLooping)) {
+                             isLooping, backward, speed)) {
 #if defined(RNSV_TRACE_LIFECYCLE) && RNSV_TRACE_LIFECYCLE
       NSLog(@"[rnskv] close %s at %.3fs", item->id.c_str(), position);
 #endif
@@ -627,15 +701,16 @@ CMTime VideoCompositionFramesExtractorHostObject::getCurrentTime() {
   @synchronized(lock) {
   if (isPlaying) {
     // When the composition has audio, the audio player is the master clock.
-    if (audioPlayer) {
+    if (audioPlayer && audioIsClock) {
       CMTime time = audioPlayer.currentTime;
       if (CMTIME_IS_NUMERIC(time)) {
         return time;
       }
     }
-    NSTimeInterval elapsedTime =
-        [[NSDate date] timeIntervalSinceDate:startDate];
-    return CMTimeMakeWithSeconds(elapsedTime, NSEC_PER_SEC);
+    // Held to the composition: backward stops at 0, and decodeTick sees it
+    // there. Past the end forward, as before: decodeTick completes there.
+    double time = clockAnchor + playbackRate * (CACurrentMediaTime() - clockAnchorHost);
+    return CMTimeMakeWithSeconds(std::max(time, 0.0), NSEC_PER_SEC);
   } else {
     return pausePosition;
   }

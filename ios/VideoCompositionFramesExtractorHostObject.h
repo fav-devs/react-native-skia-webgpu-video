@@ -58,6 +58,7 @@ private:
   // asking them again at every vsync.
   CMTime lastAdvancedTime = kCMTimeInvalid;
   uint64_t lastAdvancedGeneration = 0;
+  bool lastAdvancedBackward = false;
   // Seeks and reader advancement share the serial decoder queue. UI calls
   // update the desired clock; they never replace a reader being decoded.
   uint64_t lastAppliedSeekGeneration = 0;
@@ -69,7 +70,17 @@ private:
   dispatch_queue_t decoderQueue;
   std::atomic<bool> decoderTickPending{false};
   RNSVDisplayLinkWrapper* displayLink;
-  NSDate* startDate;
+  // The clock while playing: `clockAnchor` composition seconds at host time
+  // `clockAnchorHost` (CACurrentMediaTime), moving `playbackRate` seconds a
+  // second (see Shuttle::clockAt). Re-anchored by play, seeks, loops and rate
+  // changes.
+  double clockAnchor = 0;
+  CFTimeInterval clockAnchorHost = 0;
+  // Signed, held to [-4, 4] (see checkedShuttleRate).
+  double playbackRate = 1;
+  // Whether the decoders read backward: playing at a negative rate, or at 0
+  // after one. Paused, they read forward. Decoder queue only.
+  bool decodeBackward = false;
   CMTime pausePosition = kCMTimeZero;
   // The clock decodeCompositionFrames last picked the frames at, and when
   // (CACurrentMediaTime); invalid once play, pause or a seek moves the clock.
@@ -83,8 +94,12 @@ private:
   std::atomic<bool> seekPending = false;
   bool completeEmitted = false;
   // Plays the audio of the composition; when present it is also the master
-  // clock of the playback.
+  // clock of the playback, at 1× only: at another rate it is paused (muted)
+  // and the clock is the host's. Back at 1× while playing, the audio resumes
+  // from the clock but the host's clock stays the master until the next play
+  // or seek, so the picture does not jump to wherever the audio starts.
   AVPlayer* audioPlayer;
+  bool audioIsClock = true;
   std::atomic_flag released = ATOMIC_FLAG_INIT;
 
   void prepare();
@@ -94,6 +109,9 @@ private:
   void play();
   void pause();
   void seekTo(CMTime time);
+  void setPlaybackRate(double rate);
+  /** Starts the playing clock over from `time`, now. Under the lock. */
+  void anchorClock(double time);
   CMTime getCurrentTime();
   CMTime getPresentedTime();
   void release();
@@ -101,7 +119,8 @@ private:
                double position) const;
   void updateWindow(
       CMTime time, std::vector<std::shared_ptr<VideoCompositionItem>>& opening,
-      std::vector<std::shared_ptr<VideoCompositionItemDecoder>>& closing);
+      std::vector<std::shared_ptr<VideoCompositionItemDecoder>>& closing,
+      bool backward, double speed);
   void
   openDecoders(const std::vector<std::shared_ptr<VideoCompositionItem>>& items,
                CMTime time, uint64_t generation);

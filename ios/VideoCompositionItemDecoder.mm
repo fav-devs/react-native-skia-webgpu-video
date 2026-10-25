@@ -81,11 +81,7 @@ VideoCompositionItemDecoder::VideoCompositionItemDecoder(
 
 void VideoCompositionItemDecoder::setupReader(CMTime initialTime) {
   readerGeneration++;
-  NSError* error = nil;
-  assetReader = [AVAssetReader assetReaderWithAsset:asset error:&error];
-  if (error) {
-    throw error;
-  }
+  assetReader = nil;
 
   auto startTime = CMTimeMakeWithSeconds(item->startTime, NSEC_PER_SEC);
   // Capped at the item's end: a seek past it would otherwise ask the reader
@@ -110,16 +106,26 @@ void VideoCompositionItemDecoder::setupReader(CMTime initialTime) {
                            kCMTimeRoundingMethod_RoundTowardNegativeInfinity),
         endTime);
   }
+  assetReader = makeReader(readStart, endTime);
+}
+
+AVAssetReader* VideoCompositionItemDecoder::makeReader(CMTime readStart,
+                                                       CMTime endTime) {
   CMTime trackEnd = CMTimeRangeGetEnd(videoTrack.timeRange);
   if (CMTIME_IS_NUMERIC(trackEnd)) endTime = CMTimeMinimum(endTime, trackEnd);
   if (CMTimeCompare(readStart, endTime) >= 0) {
     // An empty item/range is valid, including a seek past the clip. Do not
     // start AVAssetReader with an empty/negative range and treat that as a
     // decoder initialization error. A later seek can create a new reader.
-    assetReader = nil;
-    return;
+    return nil;
   }
-  assetReader.timeRange = CMTimeRangeFromTimeToTime(readStart, endTime);
+  NSError* error = nil;
+  AVAssetReader* reader = [AVAssetReader assetReaderWithAsset:asset
+                                                        error:&error];
+  if (error) {
+    throw error;
+  }
+  reader.timeRange = CMTimeRangeFromTimeToTime(readStart, endTime);
 
   // AVAssetReaderTrackOutput takes pixel buffer attributes and video settings
   // in the same dictionary, so the color properties travel with them: an HDR
@@ -182,15 +188,16 @@ void VideoCompositionItemDecoder::setupReader(CMTime initialTime) {
   // Frames are only ever read (GPU import, read-only locks): skip the copy
   // AVFoundation otherwise makes of every decoded buffer before vending it.
   assetReaderOutput.alwaysCopiesSampleData = NO;
-  if (!assetReaderOutput || ![assetReader canAddOutput:assetReaderOutput]) {
+  if (!assetReaderOutput || ![reader canAddOutput:assetReaderOutput]) {
     throw [NSError errorWithDomain:@"com.azzapp.rnskv" code:0
         userInfo:@{NSLocalizedDescriptionKey : @"Video reader cannot add its decoded output"}];
   }
-  [assetReader addOutput:assetReaderOutput];
-  if (![assetReader startReading]) {
-    throw assetReader.error ?: [NSError errorWithDomain:@"com.azzapp.rnskv" code:0
+  [reader addOutput:assetReaderOutput];
+  if (![reader startReading]) {
+    throw reader.error ?: [NSError errorWithDomain:@"com.azzapp.rnskv" code:0
         userInfo:@{NSLocalizedDescriptionKey : @"Video reader cannot start decoding"}];
   }
+  return reader;
 }
 
 // In composition seconds: the preview reads playbackRate times as much of the
@@ -270,8 +277,28 @@ static CMTime lastSampleTime(const FrameQueue& queue) {
                        : CMTimeMakeWithSeconds(queue.back().first, NSEC_PER_SEC);
 }
 
-void VideoCompositionItemDecoder::advanceDecoder(CMTime currentTime) {
+void VideoCompositionItemDecoder::advanceDecoder(CMTime currentTime,
+                                                 bool backward, double rate) {
   std::lock_guard<std::mutex> readerGuard(readerMutex);
+  if (backward != this->backward) {
+    // The decoders start over at the playhead in the other direction: the
+    // forward reader cannot go back, and the backward windows are behind it.
+    // The frame on screen stays, so does the time it was shown for: backward
+    // shows nothing at or after it again.
+    @synchronized(lock) {
+      if (released) return;
+      double shown = shownTime;
+      discardReader();
+      shownTime = shown;
+      catchUpTarget = NAN;
+      this->backward = backward;
+      if (!backward) setupReader(currentTime);
+    }
+  }
+  if (backward) {
+    advanceBackward(currentTime);
+    return;
+  }
   AVAssetReader* reader = nil;
   CMTime latest = kCMTimeInvalid;
   CMTime inputPosition;
@@ -290,14 +317,29 @@ void VideoCompositionItemDecoder::advanceDecoder(CMTime currentTime) {
     // the item's end and the wrap below.
     position = CMTimeAdd(
         startTime, sourceSpan(CMTimeSubtract(currentTime, compositionStartTime)));
+    // Faster than 1×, as far ahead in wall time as at 1×.
+    double advance = DECODER_INPUT_TIME_ADVANCE * std::max(1.0, std::fabs(rate));
     inputPosition =
         realTime
             ? CMTimeAdd(position, sourceSpan(CMTimeMakeWithSeconds(
-                                      DECODER_INPUT_TIME_ADVANCE, NSEC_PER_SEC)))
+                                      advance, NSEC_PER_SEC)))
             : position;
     CMTime duration =
         sourceSpan(CMTimeMakeWithSeconds(item->duration, NSEC_PER_SEC));
     endTime = CMTimeAdd(startTime, duration);
+
+    // A reader slower than a fast clock falls further behind it the longer
+    // it reads on: restarted at the clock, it shows the clock's frame again.
+    if (realTime && CMTimeCompare(position, endTime) < 0 &&
+        Shuttle::catchUp(lastReadTime, CMTimeGetSeconds(position), rate,
+                         catchUpTarget)) {
+      double target = CMTimeGetSeconds(position);
+      double shown = shownTime;
+      discardReader();
+      shownTime = shown;
+      catchUpTarget = target;
+      setupReader(currentTime);
+    }
 
     if (realTime && CMTimeCompare(endTime, inputPosition) < 0 && !hasLooped) {
       // This pass is read to the item's end before the reader restarts for
@@ -347,11 +389,181 @@ void VideoCompositionItemDecoder::advanceDecoder(CMTime currentTime) {
     } else if (intoNextLoop && hasLooped) {
       nextLoopFrames.splice(nextLoopFrames.end(), fresh);
     } else {
+      if (!fresh.empty()) lastReadTime = fresh.back().first;
       // Or the loop wrapped meanwhile and the next loop's frames are current.
       decodedFrames.splice(decodedFrames.end(), fresh);
     }
     prunePastSamples(decodedFrames, position);
   }
+}
+
+// How long one advanceDecoder call reads a backward window before handing
+// the decoder queue back: a seek or a direction change waits at most that.
+static constexpr CFTimeInterval kBackwardReadSlice = 0.02;
+// A track with more samples than this is not scanned for its sync samples:
+// windows then start where they are planned, the reader finding the sync
+// sample before by itself.
+static constexpr size_t kMaxSyncScan = 200000;
+
+size_t VideoCompositionItemDecoder::backwardCapacity() const {
+  double bytesPerPixel = item->yuvFrames ? 1.5 : 4;
+  return Shuttle::windowCapacity(
+      static_cast<size_t>(std::max(width, 1.0) * std::max(height, 1.0) * bytesPerPixel));
+}
+
+// Decoder queue only. The sample cursor gives sync samples in the track's
+// media time; the reader stamps frames in its own timeline, after the edits.
+void VideoCompositionItemDecoder::loadSyncTimes() {
+  if (syncTimesLoaded) return;
+  syncTimesLoaded = true;
+  if (@available(iOS 16.0, macOS 10.10, *)) {
+    if (!videoTrack.canProvideSampleCursors) return;
+    AVSampleCursor* cursor = [videoTrack makeSampleCursorAtFirstSampleInDecodeOrder];
+    if (!cursor) return;
+    NSArray<AVAssetTrackSegment*>* segments = videoTrack.segments;
+    std::vector<double> times;
+    size_t visited = 0;
+    do {
+      if (++visited > kMaxSyncScan) return;
+      if (!cursor.currentSampleSyncInfo.sampleIsFullSync) continue;
+      CMTime media = cursor.presentationTimeStamp;
+      for (AVAssetTrackSegment* segment in segments) {
+        if (segment.empty) continue;
+        CMTimeMapping mapping = segment.timeMapping;
+        if (CMTimeRangeContainsTime(mapping.source, media)) {
+          times.push_back(CMTimeGetSeconds(
+              CMTimeMapTimeFromRangeToRange(media, mapping.source, mapping.target)));
+          break;
+        }
+      }
+    } while ([cursor stepInDecodeOrderByCount:1] == 1);
+    std::sort(times.begin(), times.end());
+    syncTimes = std::move(times);
+  }
+}
+
+// Decoder queue, reader mutex held. Plans the next window when fewer than two
+// are held, then reads the one being decoded for a slice of time. Its frames
+// reach the frames acquireFrameForTime picks from once it is whole: a window
+// read halfway does not say which of its frames is the clock's.
+void VideoCompositionItemDecoder::advanceBackward(CMTime currentTime) {
+  double position;
+  size_t windowsHeld = 0;
+  @synchronized(lock) {
+    if (released) return;
+    position = item->startTime +
+               ItemTime::sourceSpan(
+                   ItemTime::heldOffset(item->compositionStartTime,
+                                        item->duration,
+                                        CMTimeGetSeconds(currentTime)),
+                   item->playbackRate);
+    for (size_t i = 0; i < heldSamples.size(); i++)
+      if (i == 0 || heldSamples[i].window != heldSamples[i - 1].window)
+        windowsHeld++;
+  }
+  double floor = item->startTime;
+  if (!windowReader) {
+    if (windowsHeld >= Shuttle::kWindows) return;
+    if (!std::isnan(coveredFrom) && coveredFrom <= floor) return;
+    loadSyncTimes();
+    double frameDuration =
+        videoTrack.nominalFrameRate > 0 ? 1.0 / videoTrack.nominalFrameRate : 0;
+    Shuttle::Window next;
+    if (!Shuttle::planWindow(Shuttle::nextEnd(coveredFrom, position), floor,
+                             frameDuration, backwardCapacity(), syncTimes,
+                             next)) {
+      return;
+    }
+    // Rounded down in the track's timescale, as setupReader's start is. The
+    // reader decodes from the sync sample before the start by itself.
+    CMTime from = CMTimeMakeWithSeconds(next.start, NSEC_PER_SEC);
+    if (videoTrack.naturalTimeScale > 0) {
+      from = CMTimeConvertScale(from, videoTrack.naturalTimeScale,
+                                kCMTimeRoundingMethod_RoundTowardNegativeInfinity);
+    }
+    windowReader = makeReader(from, CMTimeMakeWithSeconds(next.end, NSEC_PER_SEC));
+    window = next;
+    windowCandidate = false;
+    windowSerial++;
+    if (!windowReader) {
+      // Nothing of the track there (past its end): covered all the same.
+      coveredFrom = next.start;
+      return;
+    }
+  }
+
+  size_t capacity = backwardCapacity();
+  AVAssetReaderOutput* output = [windowReader.outputs firstObject];
+  CFTimeInterval deadline = CACurrentMediaTime() + kBackwardReadSlice;
+  bool whole = false;
+  while (!whole) {
+    if (released.load()) return;
+    if (windowReader.status != AVAssetReaderStatusReading) {
+      whole = true;
+      break;
+    }
+    CMSampleBufferRef sample = [output copyNextSampleBuffer];
+    if (!sample) {
+      whole = true;
+      break;
+    }
+    if (CMSampleBufferGetNumSamples(sample) == 0 ||
+        !CMSampleBufferGetImageBuffer(sample)) {
+      CFRelease(sample);
+      continue;
+    }
+    double pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample));
+    auto admitted = Shuttle::admit(pts, window);
+    if (admitted == Shuttle::Admit::Stop) {
+      CFRelease(sample);
+      whole = true;
+      break;
+    }
+    if (admitted == Shuttle::Admit::Before && windowCandidate) {
+      releaseDecodedSample(windowSamples.back().sample);
+      windowSamples.pop_back();
+    }
+    try { trackDecodedSample(sample); }
+    catch (...) { CFRelease(sample); throw; }
+    try { windowSamples.push_back(HeldSample{pts, 0, sample, windowSerial}); }
+    catch (...) { releaseDecodedSample(sample); throw; }
+    windowCandidate = admitted == Shuttle::Admit::Before;
+    if (windowSamples.size() > capacity) {
+      releaseDecodedSample(windowSamples.front().sample);
+      windowSamples.erase(windowSamples.begin());
+    }
+    if (CACurrentMediaTime() > deadline) break;
+  }
+  if (!whole) return;
+  [windowReader cancelReading];
+  windowReader = nil;
+  coveredFrom = Shuttle::finishWindow(windowSamples, window);
+  @synchronized(lock) {
+    if (released) {
+      for (const auto& held : windowSamples) releaseDecodedSample(held.sample);
+    } else {
+      // Below every frame held: a window ends where what is held begins, or
+      // lower once the clock has run below it.
+      heldSamples.insert(heldSamples.begin(), windowSamples.begin(),
+                         windowSamples.end());
+    }
+  }
+  windowSamples.clear();
+}
+
+void VideoCompositionItemDecoder::discardWindows() {
+  if (windowReader) {
+    [windowReader cancelReading];
+    windowReader = nil;
+  }
+  for (const auto& held : windowSamples) releaseDecodedSample(held.sample);
+  windowSamples.clear();
+  windowCandidate = false;
+  @synchronized(lock) {
+    for (const auto& held : heldSamples) releaseDecodedSample(held.sample);
+    heldSamples.clear();
+  }
+  coveredFrom = NAN;
 }
 
 std::shared_ptr<VideoFrame>
@@ -368,6 +580,29 @@ VideoCompositionItemDecoder::acquireFrameForTime(CMTime currentTime,
   // decoding thread is not held back by the GPU.
   @synchronized(lock) {
     if (released) return nullptr;
+    if (backward) {
+      // Held to the item at both ends: past its end the item shows its last
+      // frame, which is where its first backward window ends. Plus a
+      // microsecond, as forward below.
+      double position =
+          item->startTime +
+          ItemTime::sourceSpan(
+              ItemTime::heldOffset(item->compositionStartTime, item->duration,
+                                   CMTimeGetSeconds(currentTime)),
+              item->playbackRate) +
+          1e-6;
+      auto pick = Shuttle::pickBackward(heldSamples, position,
+                                        force ? NAN : shownTime);
+      for (size_t i = pick.keep; i < heldSamples.size(); i++) {
+        if (static_cast<long>(i) == pick.show) {
+          nextFrame = heldSamples[i].sample;
+          shownTime = heldSamples[i].pts;
+        } else {
+          releaseDecodedSample(heldSamples[i].sample);
+        }
+      }
+      heldSamples.resize(pick.keep);
+    } else {
     if (hasLooped && CMTIME_IS_VALID(lastRequestedTime) &&
         CMTimeCompare(currentTime, lastRequestedTime) < 0) {
       hasLooped = false;
@@ -400,12 +635,14 @@ VideoCompositionItemDecoder::acquireFrameForTime(CMTime currentTime,
           releaseDecodedSample(nextFrame);
         }
         nextFrame = it->second;
+        shownTime = it->first;
         it = decodedFrames.erase(it);
       } else {
         break;
       }
     }
     if (!nextFrame && decodedFrames.empty()) PreviewStats::emptyQueues++;
+    }
   }
   if (nextFrame) {
     CVPixelBufferRef buffer = CMSampleBufferGetImageBuffer(nextFrame);
@@ -445,6 +682,13 @@ void VideoCompositionItemDecoder::seekTo(CMTime currentTime) {
   std::lock_guard<std::mutex> readerGuard(readerMutex);
   @synchronized(lock) {
     if (released) return;
+    catchUpTarget = NAN;
+    if (backward) {
+      // Backward, the windows around the old position go; the next
+      // advanceDecoder plans one ending at the new one.
+      discardReader();
+      return;
+    }
     // A seek the reader can simply read up to: a scrub is a run of small
     // forward steps, and rebuilding an AVAssetReader for each one is what
     // makes dragging the playhead stutter. Reading on costs the frames in
@@ -489,7 +733,10 @@ void VideoCompositionItemDecoder::discardReader() {
     nextLoopFrames.clear();
     hasLooped = false;
     lastRequestedTime = kCMTimeInvalid;
+    lastReadTime = NAN;
+    shownTime = NAN;
     readerGeneration++;
+    discardWindows();
   }
 }
 

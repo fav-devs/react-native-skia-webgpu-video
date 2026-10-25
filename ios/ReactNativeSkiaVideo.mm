@@ -305,6 +305,8 @@ RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(install) {
             // item at 1×. See getVideoCompositionFeatures.
             result.setProperty(rt, "playbackRate", true);
             result.setProperty(rt, "syncBackwardSeek", true);
+            // The composition player's signed playbackRate (see Shuttle.h).
+            result.setProperty(rt, "signedPlaybackRate", true);
             return jsi::Value(std::move(result));
           }));
   runtime.global().setProperty(runtime, "RNSkiaVideo", RNSVModule);
