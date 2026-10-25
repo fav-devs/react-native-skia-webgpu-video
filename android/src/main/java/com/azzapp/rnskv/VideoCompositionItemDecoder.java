@@ -14,6 +14,7 @@ import androidx.annotation.NonNull;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Stack;
@@ -70,6 +71,97 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
 
   private final List<Frame> pendingFrames = new ArrayList<>();
 
+  private int trackIndex = -1;
+
+  /** The latest frame the codec put out, forward, for catch-up seeks; -1 after a seek. */
+  private long latestOutputUs = -1;
+
+  /** The target of the last catch-up seek (see {@link Shuttle#catchUp}), or -1. */
+  private long catchUpTargetUs = -1;
+
+  /** The frame render() last showed, forward. */
+  private long lastRenderedUs = -1;
+
+  // Backward playback (see Shuttle). The codec decodes windows of the file
+  // behind the playhead into a surface of their own, the capture surface,
+  // one frame at a time: the GL thread snapshots each (captured), at the
+  // frame's size, and only then is the next one rendered. The capture
+  // surface replaces the codec's output while playing backward
+  // (setOutputSurface), so the forward surface never sees a backward frame.
+
+  /** Read without the lock by the GL thread. */
+  private volatile boolean backward = false;
+
+  /** Backward was asked, but the GL thread has not made the capture surface yet. */
+  private volatile boolean wantsCaptureSurface = false;
+
+  private volatile Surface captureSurface;
+
+  /** setOutputSurface failed: backward, the item keeps the frame on screen. */
+  private boolean captureUnavailable = false;
+
+  private boolean outputOnCapture = false;
+
+  /** Seeks to sync samples, for window planning. */
+  private MediaExtractor syncProbe;
+
+  private boolean syncProbeFailed = false;
+
+  /** The window being decoded, or null. Written under this decoder's lock. */
+  private volatile Shuttle.Window window;
+
+  /** The earliest file time the windows decoded so far cover, or -1. */
+  private long coveredFromUs = -1;
+
+  private long frameDurationUs = 33_333;
+
+  /**
+   * What the codec's thread and the GL thread share. The GL thread never takes
+   * this decoder's own lock, which a flush holds for its whole length; a flush
+   * clears what is under this one first, so no buffer index from before it is
+   * released after it.
+   */
+  private final Object captureLock = new Object();
+
+  /** Output buffers of the window waiting to be rendered for capture, ascending. Capture lock. */
+  private final ArrayDeque<CaptureBuffer> captureQueue = new ArrayDeque<>();
+
+  /** The latest output before the window's start (see Shuttle.admit), held. Capture lock. */
+  private CaptureBuffer candidate;
+
+  /** Rendered to the capture surface, waiting for the GL thread. Capture lock. */
+  private CaptureBuffer inFlight;
+
+  /** The frame in flight went over the window's capacity: closed once captured. Capture lock. */
+  private boolean inFlightDropped;
+
+  /** The codec has put out every frame of the window. Capture lock. */
+  private boolean windowDecoded;
+
+  /** The window is whole: its frames are held, see completedCoveredUs. Capture lock. */
+  private boolean windowCompleted;
+
+  private long completedCoveredUs = -1;
+
+  private long windowSerial = 0;
+
+  /** The captured frames of the window being decoded, ascending. Capture lock. */
+  private final ArrayList<Held> windowFrames = new ArrayList<>();
+
+  /** The frames of fully decoded windows, ascending. Capture lock. */
+  private final ArrayList<Held> heldFrames = new ArrayList<>();
+
+  private long[] heldPts = new long[Shuttle.MAX_FRAMES + 2];
+
+  private long[] heldUntil = new long[Shuttle.MAX_FRAMES + 2];
+
+  /** The frame to show backward, its serial, and its time. Capture lock. */
+  private VideoFrame selected;
+
+  private long selectedSerial = 0;
+
+  private long shownUs = -1;
+
   private OnErrorListener onErrorListener;
 
   private OnEndReachedListener onEndReachedListener;
@@ -96,7 +188,7 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
     }
     extractor = new MediaExtractor();
     extractor.setDataSource(item.getPath());
-    int trackIndex = selectTrack(extractor);
+    trackIndex = selectTrack(extractor);
     if (trackIndex == -1) {
       throw new RuntimeException("No video track");
     }
@@ -123,6 +215,15 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
     videoWidth = format.getInteger(MediaFormat.KEY_WIDTH);
     videoHeight = format.getInteger(MediaFormat.KEY_HEIGHT);
     rotation = format.containsKey(MediaFormat.KEY_ROTATION) ? format.getInteger(MediaFormat.KEY_ROTATION) : 0;
+    if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+      try {
+        float frameRate = format.getFloat(MediaFormat.KEY_FRAME_RATE);
+        if (frameRate > 0) frameDurationUs = Math.round(1e6 / frameRate);
+      } catch (ClassCastException integerRate) {
+        int frameRate = format.getInteger(MediaFormat.KEY_FRAME_RATE);
+        if (frameRate > 0) frameDurationUs = Math.round(1e6 / frameRate);
+      }
+    }
     prepared = true;
     configure();
   }
@@ -239,6 +340,10 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
     if (!prepared || !configured || released || droppingStaleCallbacks) {
       return;
     }
+    // Backward between windows: nothing to read; the next window flushes.
+    if (backward && window == null) {
+      return;
+    }
 
     if (inputEOS || itemEndReached) {
       try {
@@ -291,11 +396,18 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
     }
     try {
       extractor.advance();
-      inputEOS = extractor.getSampleTime() == -1;
+      long next = extractor.getSampleTime();
+      // Backward, read a little past the window's end: frames come out in
+      // presentation order, which reordered ones reach late.
+      inputEOS = next == -1
+        || (backward && window != null && next >= window.endUs + WINDOW_READ_PAST_US);
     } catch (Throwable e) {
       failInput(e);
     }
   }
+
+  /** How far past a backward window's end its samples are read. */
+  private static final long WINDOW_READ_PAST_US = 300_000;
 
   /** Stops feeding the codec after `error`, and reports it once. */
   private void failInput(Throwable error) {
@@ -321,6 +433,10 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
     if (released || droppingStaleCallbacks) {
       return;
     }
+    if (backward) {
+      onBackwardOutput(codec, index, info);
+      return;
+    }
     boolean outputEOS = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
     boolean sampleOutOfBounds = info.presentationTimeUs > item.sourceEndUs();
     boolean sampleBeforeStartTime =
@@ -335,6 +451,7 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
       frame.outputBufferIndex = index;
       frame.presentationTimeUs = info.presentationTimeUs;
       pendingFrames.add(frame);
+      latestOutputUs = Math.max(latestOutputUs, info.presentationTimeUs);
       if (onFrameAvailableListener != null) {
         try {
           onFrameAvailableListener.onFrameAvailable(frame.presentationTimeUs);
@@ -401,17 +518,367 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
     freeFrames.addAll(framesToRenders);
     pendingFrames.removeAll(framesToRenders);
 
-    return framesToRenders.get(framesToRenders.size() - 1).presentationTimeUs;
+    lastRenderedUs = framesToRenders.get(framesToRenders.size() - 1).presentationTimeUs;
+    return lastRenderedUs;
   }
 
   /**
-   * Seek to a specific time in the video.
+   * The preview's render: forward as {@link #render(long)}, or backward from
+   * the frames of decoded windows (see {@link Shuttle}), planning the next
+   * window. Changing direction starts the codec over at the playhead.
    *
-   * @param time the position in the composition timeline, in microseconds
+   * @param rate the player's signed rate, whose clock a fast forward codec
+   *             may be sought to catch up with
    */
-  synchronized public void seekTo(long time) {
+  synchronized public Long render(long compositionTimeUs, boolean backward, double rate) {
+    if (released || !started) {
+      return null;
+    }
+    if (backward != this.backward && !switchDirection(backward, compositionTimeUs)) {
+      backward = this.backward;
+    }
+    if (!backward) {
+      // A codec slower than a fast clock falls further behind it the longer
+      // it reads on: sought to the clock, it shows the clock's frame again.
+      long sourceUs = item.sourceTimeUs(compositionTimeUs);
+      if (sourceUs < item.sourceEndUs()
+          && Shuttle.catchUp(latestOutputUs, sourceUs, rate, catchUpTargetUs)) {
+        seekTo(compositionTimeUs);
+        catchUpTargetUs = sourceUs;
+      }
+      return render(compositionTimeUs);
+    }
+    if (!captureUnavailable) {
+      renderBackward(compositionTimeUs);
+    }
+    return null;
+  }
+
+  /** Whether the codec decodes backward windows, for the GL thread. */
+  public boolean isBackward() {
+    return backward;
+  }
+
+  /** Whether the GL thread should make the capture surface. */
+  public boolean needsCaptureSurface() {
+    return wantsCaptureSurface && captureSurface == null;
+  }
+
+  /** The surface backward frames are rendered into, made by the GL thread. */
+  public void setCaptureSurface(Surface surface) {
+    captureSurface = surface;
+  }
+
+  /**
+   * Whether {@code timestampUs} is the frame rendered for capture. Takes the
+   * capture lock only, never this decoder's.
+   */
+  public boolean expectsCapture(long timestampUs) {
+    synchronized (captureLock) {
+      return inFlight != null && inFlight.ptsUs == timestampUs;
+    }
+  }
+
+  /**
+   * The GL thread's snapshot of the frame in flight. Takes {@code frame} over
+   * and returns true when it is that frame; the caller closes it otherwise.
+   * Takes the capture lock only, never this decoder's.
+   */
+  public boolean captured(VideoFrame frame, long timestampUs) {
+    synchronized (captureLock) {
+      if (released || inFlight == null || inFlight.ptsUs != timestampUs) {
+        return false;
+      }
+      CaptureBuffer buffer = inFlight;
+      inFlight = null;
+      if (inFlightDropped) {
+        inFlightDropped = false;
+        frame.close();
+      } else {
+        windowFrames.add(new Held(buffer.ptsUs, frame, windowSerial));
+      }
+      pumpCaptureLocked();
+      completeWindowLocked();
+      return true;
+    }
+  }
+
+  /**
+   * A new reference to the frame to show backward when it changed since
+   * {@code serial}, its serial in {@code serialOut}; null otherwise. Takes
+   * the capture lock only, never this decoder's.
+   */
+  public VideoFrame retainSelectedAfter(long serial, long[] serialOut) {
+    synchronized (captureLock) {
+      if (selected == null || selectedSerial == serial) {
+        return null;
+      }
+      serialOut[0] = selectedSerial;
+      return selected.retain();
+    }
+  }
+
+  /**
+   * Starts the codec over at the playhead in the other direction. Backward
+   * needs the capture surface, which the GL thread makes on its next frame:
+   * until then, false, and the codec goes on forward.
+   */
+  private boolean switchDirection(boolean toBackward, long compositionTimeUs) {
+    if (toBackward) {
+      Surface capture = captureSurface;
+      if (capture == null) {
+        wantsCaptureSurface = true;
+        return false;
+      }
+      wantsCaptureSurface = false;
+      resetBackward();
+      flushCodec();
+      if (!outputOnCapture && !captureUnavailable) {
+        try {
+          codec.setOutputSurface(capture);
+          outputOnCapture = true;
+        } catch (RuntimeException e) {
+          // Some codecs refuse a new output surface: that item then holds its
+          // frame while the others play backward.
+          captureUnavailable = true;
+          reportError(e);
+        }
+      }
+      synchronized (captureLock) {
+        // Backward shows nothing at or after the frame on screen.
+        shownUs = hasRenderedFrame ? lastRenderedUs : -1;
+      }
+      this.backward = true;
+      return true;
+    }
+    this.backward = false;
+    resetBackward();
+    flushCodec();
+    if (outputOnCapture) {
+      try {
+        codec.setOutputSurface(surface);
+      } catch (RuntimeException e) {
+        reportError(e);
+      }
+      outputOnCapture = false;
+    }
+    synchronized (captureLock) {
+      if (selected != null) {
+        // The GL thread holds its own reference to the frame on screen.
+        selected.close();
+        selected = null;
+        selectedSerial++;
+      }
+    }
+    seekTo(compositionTimeUs);
+    return true;
+  }
+
+  /** The playhead's time in the file, held to the item. */
+  private long sourcePositionUs(long compositionTimeUs) {
+    return TimeHelpers.secToUs(item.getStartTime()) + ItemTime.sourceSpanUs(
+      ItemTime.heldOffsetUs(
+        TimeHelpers.secToUs(item.getCompositionStartTime()),
+        TimeHelpers.secToUs(item.getDuration()),
+        compositionTimeUs),
+      item.getPlaybackRate());
+  }
+
+  /** Under this decoder's lock. */
+  private void renderBackward(long compositionTimeUs) {
+    long positionUs = sourcePositionUs(compositionTimeUs);
+    long floorUs = TimeHelpers.secToUs(item.getStartTime());
+    int windowsHeld = 0;
+    synchronized (captureLock) {
+      if (windowCompleted) {
+        windowCompleted = false;
+        window = null;
+        coveredFromUs = completedCoveredUs;
+      }
+      int count = heldFrames.size();
+      if (count > heldPts.length) {
+        heldPts = new long[count];
+        heldUntil = new long[count];
+      }
+      for (int i = 0; i < count; i++) {
+        Held held = heldFrames.get(i);
+        heldPts[i] = held.ptsUs;
+        heldUntil[i] = held.untilUs;
+      }
+      // Plus a microsecond, as forward: a time asked at a frame's own is that frame.
+      int[] pick = Shuttle.pickBackward(heldPts, heldUntil, count, positionUs + 1, shownUs);
+      for (int i = count - 1; i >= pick[1]; i--) {
+        Held held = heldFrames.remove(i);
+        if (i == pick[0]) {
+          VideoFrame previous = selected;
+          selected = held.frame;
+          selectedSerial++;
+          shownUs = held.ptsUs;
+          if (previous != null) previous.close();
+        } else {
+          held.frame.close();
+        }
+      }
+      for (int i = 0; i < heldFrames.size(); i++) {
+        if (i == 0 || heldFrames.get(i).window != heldFrames.get(i - 1).window) windowsHeld++;
+      }
+    }
+    if (window == null && windowsHeld < Shuttle.WINDOWS
+        && (coveredFromUs < 0 || coveredFromUs > floorUs)) {
+      startWindow(positionUs, floorUs);
+    }
+  }
+
+  /** Under this decoder's lock: flushes the codec and reads the next window. */
+  private void startWindow(long positionUs, long floorUs) {
+    int[] size = FrameSize.of(item.getWidth(), item.getHeight(), item.getMaxLongSide(),
+      videoWidth, videoHeight, rotation);
+    int capacity = Shuttle.windowCapacity((long) size[0] * size[1] * 4);
+    Shuttle.Window next = Shuttle.planWindow(Shuttle.nextEnd(coveredFromUs, positionUs), floorUs,
+      frameDurationUs, capacity, syncIndex());
+    if (next == null) {
+      coveredFromUs = floorUs;
+      return;
+    }
+    flushCodec();
+    synchronized (captureLock) {
+      windowDecoded = false;
+      windowCompleted = false;
+      windowSerial++;
+      windowCapacity = capacity;
+      for (Held held : windowFrames) held.frame.close();
+      windowFrames.clear();
+    }
+    window = next;
+    extractor.seekTo(next.decodeFromUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+    inputEOS = false;
+    itemEndReached = false;
+    codec.start();
+  }
+
+  private int windowCapacity = 1;
+
+  /** On the codec's thread, under this decoder's lock. */
+  private void onBackwardOutput(MediaCodec codec, int index, MediaCodec.BufferInfo info) {
+    boolean eos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+    Shuttle.Window current = window;
+    synchronized (captureLock) {
+      if (current == null || windowDecoded) {
+        releaseQuietly(codec, index, false);
+        return;
+      }
+      if (!SurfaceOutputPolicy.hasFrame(info.size, info.flags)) {
+        releaseQuietly(codec, index, false);
+      } else {
+        long pts = info.presentationTimeUs;
+        int admitted = pts > item.sourceEndUs() ? Shuttle.STOP : Shuttle.admit(pts, current);
+        if (admitted == Shuttle.STOP) {
+          releaseQuietly(codec, index, false);
+          eos = true;
+        } else if (admitted == Shuttle.BEFORE) {
+          if (candidate != null) releaseQuietly(codec, candidate.index, false);
+          candidate = new CaptureBuffer(index, pts);
+        } else {
+          if (candidate != null) {
+            captureQueue.add(candidate);
+            candidate = null;
+          }
+          captureQueue.add(new CaptureBuffer(index, pts));
+          trimWindowLocked(codec);
+          pumpCaptureLocked();
+        }
+      }
+      if (eos) {
+        windowDecoded = true;
+        inputEOS = true;
+        if (candidate != null) {
+          // No frame inside the window: the one on screen at its start.
+          captureQueue.add(candidate);
+          candidate = null;
+          pumpCaptureLocked();
+        }
+        completeWindowLocked();
+      }
+    }
+  }
+
+  /** Keeps the window to its latest frames: the oldest goes, never one in between. */
+  private void trimWindowLocked(MediaCodec codec) {
+    while (windowFrames.size() + captureQueue.size() + (inFlight != null && !inFlightDropped ? 1 : 0)
+        > windowCapacity) {
+      if (!windowFrames.isEmpty()) {
+        windowFrames.remove(0).frame.close();
+      } else if (inFlight != null && !inFlightDropped) {
+        inFlightDropped = true;
+      } else if (!captureQueue.isEmpty()) {
+        releaseQuietly(codec, captureQueue.pollFirst().index, false);
+      } else {
+        break;
+      }
+    }
+  }
+
+  /** Renders the next frame of the window for capture, once the previous one is captured. */
+  private void pumpCaptureLocked() {
+    MediaCodec current = codec;
+    while (inFlight == null && !captureQueue.isEmpty() && current != null && !released) {
+      CaptureBuffer next = captureQueue.pollFirst();
+      try {
+        current.releaseOutputBuffer(next.index, true);
+        inFlight = next;
+      } catch (Throwable e) {
+        // A codec flushed or released meanwhile: the buffer is gone with it.
+      }
+    }
+  }
+
+  /** The window is whole once every frame it kept is captured. */
+  private void completeWindowLocked() {
+    Shuttle.Window current = window;
+    if (!windowDecoded || windowCompleted || inFlight != null || !captureQueue.isEmpty()
+        || candidate != null || current == null) {
+      return;
+    }
+    long[] pts = new long[windowFrames.size()];
+    for (int i = 0; i < pts.length; i++) pts[i] = windowFrames.get(i).ptsUs;
+    long[] until = Shuttle.untilOf(pts, current);
+    for (int i = 0; i < pts.length; i++) windowFrames.get(i).untilUs = until[i];
+    // Below every frame held: a window ends where what is held begins, or
+    // lower once the clock has run below it.
+    heldFrames.addAll(0, windowFrames);
+    windowFrames.clear();
+    completedCoveredUs = Shuttle.coveredFrom(pts, current);
+    windowCompleted = true;
+  }
+
+  /** Drops the backward windows: the one being decoded and the decoded ones. */
+  private void resetBackward() {
+    synchronized (captureLock) {
+      for (Held held : windowFrames) held.frame.close();
+      windowFrames.clear();
+      for (Held held : heldFrames) held.frame.close();
+      heldFrames.clear();
+      windowDecoded = false;
+      windowCompleted = false;
+      shownUs = -1;
+    }
+    window = null;
+    coveredFromUs = -1;
+  }
+
+  /**
+   * Flushes the codec, leaving it stopped: the buffers it held for display or
+   * capture go with the flush, under the capture lock first.
+   */
+  private void flushCodec() {
     freeFrames.addAll(pendingFrames);
     pendingFrames.clear();
+    synchronized (captureLock) {
+      captureQueue.clear();
+      candidate = null;
+      inFlight = null;
+      inFlightDropped = false;
+    }
     codec.flush();
     // Queued behind the callbacks from before the flush, and ahead of those
     // start() brings: they run on this handler's thread in order.
@@ -426,6 +893,65 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
         }
       });
     }
+    latestOutputUs = -1;
+  }
+
+  /** The file's sync samples, asked of a second extractor that only seeks. */
+  private Shuttle.SyncIndex syncIndex() {
+    if (syncProbe == null && !syncProbeFailed) {
+      MediaExtractor probe = new MediaExtractor();
+      try {
+        probe.setDataSource(item.getPath());
+        probe.selectTrack(trackIndex);
+        syncProbe = probe;
+      } catch (IOException | RuntimeException e) {
+        syncProbeFailed = true;
+        probe.release();
+      }
+    }
+    MediaExtractor probe = syncProbe;
+    return new Shuttle.SyncIndex() {
+      @Override
+      public long previous(long timeUs) {
+        if (probe == null || timeUs < 0) return -1;
+        probe.seekTo(timeUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+        long sync = probe.getSampleTime();
+        return sync >= 0 && sync <= timeUs ? sync : -1;
+      }
+
+      @Override
+      public long next(long timeUs) {
+        if (probe == null) return -1;
+        probe.seekTo(Math.max(0, timeUs), MediaExtractor.SEEK_TO_NEXT_SYNC);
+        long sync = probe.getSampleTime();
+        return sync >= timeUs ? sync : -1;
+      }
+    };
+  }
+
+  private static void releaseQuietly(MediaCodec codec, int index, boolean render) {
+    try {
+      codec.releaseOutputBuffer(index, render);
+    } catch (Throwable e) {
+      // Flushed or released meanwhile.
+    }
+  }
+
+  /**
+   * Seek to a specific time in the video.
+   *
+   * @param time the position in the composition timeline, in microseconds
+   */
+  synchronized public void seekTo(long time) {
+    catchUpTargetUs = -1;
+    if (backward) {
+      // The windows around the old position go; the next render plans one
+      // ending at the new one. The codec stays flushed until then.
+      resetBackward();
+      flushCodec();
+      return;
+    }
+    flushCodec();
     long itemTime = time - TimeHelpers.secToUs(item.getCompositionStartTime());
     long seekTime = TimeHelpers.secToUs(item.getStartTime())
       + ItemTime.sourceSpanUs(Math.max(itemTime, 0), item.getPlaybackRate());
@@ -444,6 +970,20 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
   synchronized public void release() {
     if (!released) {
       released = true;
+      resetBackward();
+      synchronized (captureLock) {
+        captureQueue.clear();
+        candidate = null;
+        inFlight = null;
+        if (selected != null) {
+          selected.close();
+          selected = null;
+        }
+      }
+      if (syncProbe != null) {
+        syncProbe.release();
+        syncProbe = null;
+      }
       if (extractor != null) {
         extractor.release();
       }
@@ -521,6 +1061,31 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
 
   public interface OnEndReachedListener {
     void onEndReached();
+  }
+
+  /** An output buffer of a backward window, before it is rendered for capture. */
+  private static final class CaptureBuffer {
+    final int index;
+    final long ptsUs;
+
+    CaptureBuffer(int index, long ptsUs) {
+      this.index = index;
+      this.ptsUs = ptsUs;
+    }
+  }
+
+  /** A captured frame of a backward window. */
+  private static final class Held {
+    final long ptsUs;
+    long untilUs;
+    final VideoFrame frame;
+    final long window;
+
+    Held(long ptsUs, VideoFrame frame, long window) {
+      this.ptsUs = ptsUs;
+      this.frame = frame;
+      this.window = window;
+    }
   }
 
   /**

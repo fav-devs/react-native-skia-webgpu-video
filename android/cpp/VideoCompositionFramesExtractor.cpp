@@ -48,6 +48,18 @@ void VideoCompositionFramesExtractor::setIsLooping(jboolean isLooping) const {
   setIsLoopingMethod(self(), isLooping);
 }
 
+jdouble VideoCompositionFramesExtractor::getPlaybackRate() const {
+  static const auto getPlaybackRateMethod =
+      getClass()->getMethod<jdouble()>("getPlaybackRate");
+  return getPlaybackRateMethod(self());
+}
+
+void VideoCompositionFramesExtractor::setPlaybackRate(jdouble rate) const {
+  static const auto setPlaybackRateMethod =
+      getClass()->getMethod<void(jdouble)>("setPlaybackRate");
+  setPlaybackRateMethod(self(), rate);
+}
+
 jlong VideoCompositionFramesExtractor::getCurrentPosition() const {
   static const auto getCurrentPositionMethod =
       getClass()->getMethod<jlong()>("getCurrentPosition");

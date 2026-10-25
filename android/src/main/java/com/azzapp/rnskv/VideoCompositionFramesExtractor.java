@@ -33,6 +33,7 @@ public class VideoCompositionFramesExtractor {
   private static final int PLAYBACK_SEEK = 5;
   private static final int PLAYBACK_RELEASE = 6;
   private static final int PLAYBACK_VSYNC_RELEASE = 7;
+  private static final int PLAYBACK_RATE = 8;
 
   private final VideoComposition composition;
 
@@ -57,7 +58,15 @@ public class VideoCompositionFramesExtractor {
   // Read on the thread that collects frames (see releaseForNextVsync), written on the playback thread.
   private volatile boolean isPlaying = false;
 
-  private volatile long startTime = 0;
+  // The clock while playing: immutable, so the threads that read it see an
+  // anchor and a rate that go together. Re-anchored by play, seeks, loops and
+  // rate changes, on the playback thread.
+  private volatile Shuttle.Clock clock = new Shuttle.Clock(0, 0, 1);
+  // The rate last asked for, held to [-4, 4] by the caller (checkedShuttleRate);
+  // the clock takes it on the playback thread.
+  private volatile double playbackRate = 1;
+  // Whether the decoders read backward. Playback thread only.
+  private boolean decodingBackward = false;
   // The position playback last started or was sought to while playing.
   private volatile long playStartPosition = 0;
   private volatile long pausePosition = 0;
@@ -205,7 +214,7 @@ public class VideoCompositionFramesExtractor {
     lastVsyncNanos = vsyncNanos;
     long vsyncPeriodNanos = period;
     long position = isPlaying
-      ? (vsyncNanos + vsyncPeriodNanos) / 1000 - startTime
+      ? clock.at((vsyncNanos + vsyncPeriodNanos) / 1000, durationUs())
       : pausePosition;
     lastVsyncReleaseNanos = System.nanoTime();
     vsyncReleasePosition = position;
@@ -249,7 +258,11 @@ public class VideoCompositionFramesExtractor {
    * @return the current position of the player in microseconds
    */
   public long getCurrentPosition() {
-    return isPlaying ? microTime() - startTime : pausePosition;
+    return isPlaying ? clock.at(microTime(), durationUs()) : pausePosition;
+  }
+
+  private long durationUs() {
+    return TimeHelpers.secToUs(composition.getDuration());
   }
 
   /**
@@ -268,9 +281,30 @@ public class VideoCompositionFramesExtractor {
       || System.nanoTime() - lastVsyncReleaseNanos > VSYNC_RELEASE_TIMEOUT_NANOS) {
       return getCurrentPosition();
     }
-    // Never before the play or seek that started this run: the vsync can
-    // precede it by up to a period.
-    return Math.max(vsyncNanos / 1000 - startTime, playStartPosition);
+    // Never before the play or seek that started this run, in the playing
+    // direction: the vsync can precede it by up to a period.
+    Shuttle.Clock current = clock;
+    long position = current.at(vsyncNanos / 1000, durationUs());
+    return current.rate < 0
+      ? Math.min(position, playStartPosition)
+      : Math.max(position, playStartPosition);
+  }
+
+  /**
+   * The signed rate the player plays at, see {@link Shuttle}. Taken at once by
+   * the clock while playing, without a seek: only a change of direction
+   * starts the decoders over.
+   *
+   * @param rate held to [-4, 4] by the caller
+   */
+  public void setPlaybackRate(double rate) {
+    playbackRate = rate;
+    handler.removeMessages(PLAYBACK_RATE);
+    handler.sendEmptyMessage(PLAYBACK_RATE);
+  }
+
+  public double getPlaybackRate() {
+    return playbackRate;
   }
 
   /**
@@ -339,15 +373,36 @@ public class VideoCompositionFramesExtractor {
       playWhenReady = true;
       return;
     }
+    double rate = playbackRate;
+    // Backward from the start: nothing to play.
+    if (isPlaying || Shuttle.reachedStart(pausePosition, rate)) {
+      return;
+    }
     if (isEOS) {
       isEOS = false;
-      pausePosition = 0;
-      seekInternal(0);
+      // Backward, it plays from the end.
+      if (rate >= 0) {
+        pausePosition = 0;
+        seekInternal(0);
+      }
     }
     playStartPosition = pausePosition;
-    startTime = microTime() - pausePosition;
+    clock = new Shuttle.Clock(pausePosition, microTime(), rate);
     isPlaying = true;
     pausePosition = 0;
+  }
+
+  private void rateInternal() {
+    double rate = playbackRate;
+    Shuttle.Clock current = clock;
+    if (rate == current.rate) {
+      return;
+    }
+    long position = isPlaying ? getCurrentPosition() : pausePosition;
+    if (isPlaying) {
+      playStartPosition = position;
+    }
+    clock = new Shuttle.Clock(position, microTime(), rate);
   }
 
   private void pauseInternal() {
@@ -366,8 +421,17 @@ public class VideoCompositionFramesExtractor {
     long loopStartTime = SystemClock.elapsedRealtime();
 
     long currentPosition = getCurrentPosition();
+    double rate = clock.rate;
 
-    isEOS = currentPosition >= TimeHelpers.secToUs(composition.getDuration());
+    if (isPlaying && Shuttle.reachedStart(currentPosition, rate)) {
+      // Backward to the start: stopped there, on its first frame, which the
+      // decoders read forward again below. Not a completion.
+      isPlaying = false;
+      pausePosition = 0;
+      currentPosition = 0;
+    }
+    // Backward from the end is not a completion either.
+    isEOS = currentPosition >= durationUs() && !(isPlaying && rate < 0);
     if (isEOS) {
       if (!completeDispatched) {
         completeDispatched = true;
@@ -379,6 +443,8 @@ public class VideoCompositionFramesExtractor {
     } else {
       completeDispatched = false;
     }
+    decodingBackward = isPlaying && Shuttle.backwardAt(rate, decodingBackward);
+    decoder.setPlayback(decodingBackward, isPlaying ? rate : 1);
     decoder.updateWindow(currentPosition);
     if (System.nanoTime() - lastVsyncReleaseNanos > VSYNC_RELEASE_TIMEOUT_NANOS) {
       // No one collecting at vsync (not yet, or no longer): release on the tick.
@@ -388,7 +454,9 @@ public class VideoCompositionFramesExtractor {
       playInternal();
     }
     if (audioPlayer != null) {
-      audioPlayer.update(getCurrentPosition(), isPlaying);
+      // At 1× only: muted (paused) at any other rate, then sought back to the
+      // clock by its drift correction.
+      audioPlayer.update(getCurrentPosition(), isPlaying && clock.rate == 1);
     }
     long delay = 10;
     long duration = (SystemClock.elapsedRealtime() - loopStartTime);
@@ -413,7 +481,7 @@ public class VideoCompositionFramesExtractor {
     }
     if (isPlaying) {
       playStartPosition = position;
-      startTime = microTime() - position;
+      clock = new Shuttle.Clock(position, microTime(), clock.rate);
     } else {
       pausePosition = position;
     }
@@ -474,6 +542,10 @@ public class VideoCompositionFramesExtractor {
           }
           case PLAYBACK_VSYNC_RELEASE -> {
             vsyncReleaseInternal();
+            return true;
+          }
+          case PLAYBACK_RATE -> {
+            rateInternal();
             return true;
           }
           default -> {

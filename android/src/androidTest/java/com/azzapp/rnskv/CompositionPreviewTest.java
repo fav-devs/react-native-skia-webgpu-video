@@ -50,6 +50,9 @@ public class CompositionPreviewTest {
   // Paused after a seek: the exact frame.
   private static final long PAUSED_SLACK_US = 1_000;
 
+  // Backward: the frame trails the clock by up to a window being captured.
+  private static final long BACKWARD_SLACK_US = 600_000;
+
   private static File video;
 
   private VideoComposition composition;
@@ -70,11 +73,19 @@ public class CompositionPreviewTest {
 
   private volatile long clockStartNs = 0;
 
+  /** The player's signed rate, from clockStartUs at clockStartNs. */
+  private volatile double rate = 1;
+
+  private volatile long clockStartUs = 0;
+
   private final Runnable tick = new Runnable() {
     @Override
     public void run() {
-      if (playing) {
+      if (playing && rate == 1) {
         positionUs = (System.nanoTime() - clockStartNs) / 1000;
+      } else if (playing) {
+        positionUs = Math.max(0,
+          clockStartUs + Math.round((System.nanoTime() - clockStartNs) / 1000 * rate));
       }
       decoder.updateWindow(positionUs);
       decoder.render(positionUs);
@@ -144,6 +155,72 @@ public class CompositionPreviewTest {
     awaitFrame(clip, 2.25);
     seek(0.5);
     awaitFrame(clip, 0.5);
+  }
+
+  // A shuttle: the clock runs backward and the codecs decode windows behind
+  // it, captured one frame at a time. The frame shown is never ahead of the
+  // clock in the playing direction (an earlier file time), never moves
+  // forward within an item, keeps up with the clock, and the start holds the
+  // first frame.
+  @Test
+  public void aBackwardMontagePlaysBackToTheStart() throws Exception {
+    open(true);
+    double from = composition.getDuration() - 0.2;
+    seek(from);
+    awaitFrame(MONTAGE[2], from);
+    playAt(-1);
+    Map<String, Long> lastShownUs = new HashMap<>();
+    int checks = 0;
+    while (positionUs > 0) {
+      Map<String, VideoFrame> frames = pump();
+      double time = positionUs / 1e6;
+      Clip clip = clipAt(clips, time);
+      VideoFrame frame = clip != null ? frames.get(clip.id) : null;
+      if (frame != null && time - clip.compositionStart > 0.3 && clip.end() - time > 0.3) {
+        long shownUs = TimeHelpers.nsecToUs(frame.getTimestampNs());
+        long expectedUs = clip.sourceUs(time);
+        assertTrue(clip.id + " at " + time + "s shows " + shownUs + "us, ahead of " + expectedUs,
+          shownUs >= expectedUs - TestVideo.FRAME_US - PAUSED_SLACK_US);
+        assertTrue(clip.id + " at " + time + "s shows " + shownUs + "us, far behind " + expectedUs,
+          shownUs <= expectedUs + BACKWARD_SLACK_US);
+        Long last = lastShownUs.put(clip.id, shownUs);
+        assertTrue(clip.id + " went forward to " + shownUs, last == null || shownUs <= last);
+        checks++;
+      }
+      SystemClock.sleep(16);
+    }
+    assertTrue("only " + checks + " frames checked", checks > 50);
+    onPlayback(() -> {
+      playing = false;
+      decoder.setPlayback(false, 1);
+    });
+    awaitFrame(MONTAGE[0], 0);
+  }
+
+  // A drag that turns around: forward, backward, forward again, at speeds
+  // that change at every frame, then the exact frame once released.
+  @Test
+  public void aShuttleTurningAroundSettlesOnTheRightFrame() throws Exception {
+    open(true);
+    seek(3.0);
+    awaitFrame(MONTAGE[1], 3.0);
+    Random random = new Random(3);
+    for (double[] leg : new double[][]{{1.5, 0.6}, {-2.5, 0.8}, {3.0, 0.4}, {-0.5, 0.5}}) {
+      playAt(leg[0]);
+      long until = SystemClock.uptimeMillis() + Math.round(leg[1] * 1000);
+      while (SystemClock.uptimeMillis() < until) {
+        pump();
+        double magnitude = Math.abs(leg[0]) * (0.75 + random.nextDouble() / 2);
+        playAt(Math.copySign(magnitude, leg[0]));
+        SystemClock.sleep(33);
+      }
+    }
+    onPlayback(() -> {
+      playing = false;
+      decoder.setPlayback(false, 1);
+    });
+    seek(4.2);
+    awaitFrame(MONTAGE[2], 4.2);
   }
 
   @Test
@@ -306,6 +383,17 @@ public class CompositionPreviewTest {
     });
   }
 
+  /** As VideoCompositionFramesExtractor plays at a signed rate. */
+  private void playAt(double signedRate) throws Exception {
+    onPlayback(() -> {
+      clockStartUs = positionUs;
+      clockStartNs = System.nanoTime();
+      rate = signedRate;
+      playing = true;
+      decoder.setPlayback(Shuttle.backwardAt(signedRate, signedRate < 0), signedRate);
+    });
+  }
+
   /** As VideoCompositionFramesExtractor#seekInternal does it. */
   private void seek(double seconds) throws Exception {
     long position = TimeHelpers.secToUs(seconds);
@@ -313,7 +401,8 @@ public class CompositionPreviewTest {
       decoder.seekTo(position);
       decoder.updateWindow(position);
       positionUs = position;
-      clockStartNs = System.nanoTime() - position * 1000;
+      clockStartUs = position;
+      clockStartNs = rate == 1 ? System.nanoTime() - position * 1000 : System.nanoTime();
     });
   }
 

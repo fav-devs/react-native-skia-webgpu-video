@@ -41,6 +41,10 @@ public:
 
   void setIsLooping(jboolean isLooping) const;
 
+  jdouble getPlaybackRate() const;
+
+  void setPlaybackRate(jdouble rate) const;
+
   local_ref<JMap<JString, VideoFrame>> decodeCompositionFrames();
 
   void makeGLContextCurrent() const;

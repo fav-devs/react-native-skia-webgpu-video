@@ -60,6 +60,8 @@ void install(jsi::Runtime& jsiRuntime) {
         // See getVideoCompositionFeatures.
         info.setProperty(runtime, "playbackRate", true);
         info.setProperty(runtime, "syncBackwardSeek", true);
+        // The composition player's signed playbackRate (see Shuttle.java).
+        info.setProperty(runtime, "signedPlaybackRate", true);
         return info;
       }));
   auto createVideoPlayer = jsi::Function::createFromHostFunction(

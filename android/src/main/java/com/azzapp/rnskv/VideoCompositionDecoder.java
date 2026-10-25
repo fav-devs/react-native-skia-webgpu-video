@@ -58,6 +58,11 @@ public class VideoCompositionDecoder {
 
   private long seekPositionUs = 0;
 
+  /** The preview playing backward (see {@link Shuttle}), and the player's rate. */
+  private volatile boolean backward = false;
+
+  private volatile double rate = 1;
+
   private HandlerThread openerThread;
 
   private Handler opener;
@@ -194,6 +199,17 @@ public class VideoCompositionDecoder {
   }
 
   /**
+   * How the preview plays: backward, its decoders decode windows behind the
+   * playhead, and lazy ones open past their item's end; {@code rate} is the
+   * player's signed rate. Applied by the next {@link #render} and
+   * {@link #updateWindow}.
+   */
+  public void setPlayback(boolean backward, double rate) {
+    this.backward = backward;
+    this.rate = rate;
+  }
+
+  /**
    * @return whether the item has a decoder, which is always the case without
    * lazy decoders once prepared
    */
@@ -255,10 +271,15 @@ public class VideoCompositionDecoder {
    */
   public synchronized Map<String, Long> render(long currentPositionUs) {
     Map<String, Long> renderedTimes = new HashMap<>();
+    boolean backward = this.backward;
+    double rate = this.rate;
     slots.forEach((item, slot) -> {
       VideoCompositionItemDecoder decoder = slot.decoder;
       if (decoder != null) {
-        renderedTimes.put(item.getId(), decoder.render(currentPositionUs));
+        Long rendered = realTime
+          ? decoder.render(currentPositionUs, backward, rate)
+          : decoder.render(currentPositionUs);
+        renderedTimes.put(item.getId(), rendered);
       }
     });
     return renderedTimes;
@@ -330,16 +351,20 @@ public class VideoCompositionDecoder {
       }
       it.remove();
       GLFrameExtractor extractor;
+      GLFrameExtractor capture;
       synchronized (slot) {
         extractor = slot.extractor;
         slot.extractor = null;
+        capture = slot.captureExtractor;
+        slot.captureExtractor = null;
       }
-      if (extractor != null) {
+      if (extractor != null || capture != null) {
         if (!current) {
           eglResourcesHolder.makeCurrent();
           current = true;
         }
-        extractor.release();
+        if (extractor != null) extractor.release();
+        if (capture != null) capture.release();
       }
       // The item may have been reopened since, and drawn its own frame.
       String id = slot.item.getId();
@@ -386,24 +411,70 @@ public class VideoCompositionDecoder {
       );
       int frameWidth = size[0];
       int frameHeight = size[1];
+      if (decoder.needsCaptureSurface() && slot.captureExtractor == null) {
+        GLFrameExtractor capture = new GLFrameExtractor(false, composition.isHardwareBufferEnabled());
+        synchronized (slot) {
+          slot.captureExtractor = capture;
+        }
+        decoder.setCaptureSurface(capture.getSurface());
+      }
+      if (decoder.isBackward()) {
+        captureBackward(item, slot, decoder, glFrameExtractor, frameWidth, frameHeight);
+        continue;
+      }
       if (!glFrameExtractor.decodeNextFrame(frameWidth, frameHeight)) {
         continue;
       }
-      VideoFrame nextFrame = glFrameExtractor.snapshotFrame(0);
-      VideoFrame previous = slot.frame;
-      final VideoFrame displaced;
-      try { displaced = videoFrames.put(item.getId(), nextFrame); }
-      catch (RuntimeException | Error error) {
-        try { nextFrame.close(); }
-        catch (RuntimeException | Error cleanup) { error.addSuppressed(cleanup); }
-        throw error;
-      }
-      slot.frame = nextFrame;
-      framesVersion++;
-      if (previous != null) previous.close();
-      if (displaced != null && displaced != previous) displaced.close();
+      publish(item, slot, glFrameExtractor.snapshotFrame(0));
     }
     return videoFrames;
+  }
+
+  /**
+   * Backward, on the GL thread: snapshots the frame the codec rendered into
+   * the capture surface for its window, at the frame's size, and shows the
+   * frame the decoder picked for the clock. One capture per item per call:
+   * the next frame is rendered once this one is taken.
+   */
+  private void captureBackward(VideoComposition.Item item, Slot slot,
+      VideoCompositionItemDecoder decoder, GLFrameExtractor forward, int width, int height) {
+    // Frames the codec put into the forward surface before it went backward:
+    // stale once it comes back forward.
+    if (forward.hasPendingFrame()) {
+      forward.decodeNextFrame(width, height);
+    }
+    GLFrameExtractor capture = slot.captureExtractor;
+    if (capture != null && capture.decodeNextFrame(width, height)) {
+      long timestampUs = capture.getLatestTimeStampNs() / 1000;
+      if (decoder.expectsCapture(timestampUs)) {
+        VideoFrame frame = capture.snapshotFrame(0);
+        if (!decoder.captured(frame, timestampUs)) {
+          frame.close();
+        }
+      }
+    }
+    long[] serial = new long[1];
+    VideoFrame selected = decoder.retainSelectedAfter(slot.selectedSerial, serial);
+    if (selected != null) {
+      slot.selectedSerial = serial[0];
+      publish(item, slot, selected);
+    }
+  }
+
+  /** Puts an item's new frame in the frames map, closing the one it replaces. */
+  private void publish(VideoComposition.Item item, Slot slot, VideoFrame nextFrame) {
+    VideoFrame previous = slot.frame;
+    final VideoFrame displaced;
+    try { displaced = videoFrames.put(item.getId(), nextFrame); }
+    catch (RuntimeException | Error error) {
+      try { nextFrame.close(); }
+      catch (RuntimeException | Error cleanup) { error.addSuppressed(cleanup); }
+      throw error;
+    }
+    slot.frame = nextFrame;
+    framesVersion++;
+    if (previous != null && previous != nextFrame) previous.close();
+    if (displaced != null && displaced != previous && displaced != nextFrame) displaced.close();
   }
 
   /**
@@ -526,12 +597,14 @@ public class VideoCompositionDecoder {
 
   private boolean opens(VideoComposition.Item item, long positionUs) {
     long startUs = TimeHelpers.secToUs(item.getCompositionStartTime());
-    return window.opens(startUs, startUs + TimeHelpers.secToUs(item.getDuration()), positionUs);
+    return window.opens(startUs, startUs + TimeHelpers.secToUs(item.getDuration()), positionUs,
+      backward, Math.abs(rate));
   }
 
   private boolean keeps(VideoComposition.Item item, long positionUs) {
     long startUs = TimeHelpers.secToUs(item.getCompositionStartTime());
-    return window.keeps(startUs, startUs + TimeHelpers.secToUs(item.getDuration()), positionUs);
+    return window.keeps(startUs, startUs + TimeHelpers.secToUs(item.getDuration()), positionUs,
+      backward, Math.abs(rate));
   }
 
   /**
@@ -652,12 +725,18 @@ public class VideoCompositionDecoder {
 
   private static void releaseExtractor(Slot slot) {
     GLFrameExtractor extractor;
+    GLFrameExtractor capture;
     synchronized (slot) {
       extractor = slot.extractor;
       slot.extractor = null;
+      capture = slot.captureExtractor;
+      slot.captureExtractor = null;
     }
     if (extractor != null) {
       extractor.release();
+    }
+    if (capture != null) {
+      capture.release();
     }
   }
 
@@ -741,6 +820,12 @@ public class VideoCompositionDecoder {
     final long seekGeneration;
 
     volatile GLFrameExtractor extractor;
+
+    /** The surface backward frames are captured from, made on first use. GL thread. */
+    volatile GLFrameExtractor captureExtractor;
+
+    /** The serial of the backward frame last put in the frames map. GL thread only. */
+    long selectedSerial;
 
     volatile VideoCompositionItemDecoder decoder;
 

@@ -39,6 +39,7 @@ VideoCompositionFramesExtractorHostObject::getPropertyNames(jsi::Runtime& rt) {
   result.push_back(jsi::PropNameID::forUtf8(rt, std::string("framesVersion")));
   result.push_back(jsi::PropNameID::forUtf8(rt, std::string("isLooping")));
   result.push_back(jsi::PropNameID::forUtf8(rt, std::string("isPlaying")));
+  result.push_back(jsi::PropNameID::forUtf8(rt, std::string("playbackRate")));
   return result;
 }
 
@@ -184,6 +185,9 @@ jsi::Value VideoCompositionFramesExtractorHostObject::get(
   } else if (propName == "isPlaying") {
     std::lock_guard<std::recursive_mutex> lock(playerMutex);
     return {!released.test() && player->getIsPlaying()};
+  } else if (propName == "playbackRate") {
+    std::lock_guard<std::recursive_mutex> lock(playerMutex);
+    return {released.test() ? 1.0 : (double)player->getPlaybackRate()};
   }
   return jsi::Value::undefined();
 }
@@ -199,6 +203,16 @@ void VideoCompositionFramesExtractorHostObject::set(
   auto propName = propNameId.utf8(runtime);
   if (propName == "isLooping") {
     player->setIsLooping(value.asBool());
+  } else if (propName == "playbackRate") {
+    if (!value.isNumber())
+      throw jsi::JSError(runtime, "playbackRate expects a number");
+    double rate;
+    try {
+      rate = checkedShuttleRate(value.asNumber());
+    } catch (const std::invalid_argument& error) {
+      throw jsi::JSError(runtime, error.what());
+    }
+    player->setPlaybackRate(rate);
   }
 }
 
