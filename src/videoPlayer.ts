@@ -264,11 +264,23 @@ export const useVideoPlayback = ({
     [generation],
   );
   // The frame on screen went with a lost GPU device. A playing player shows
-  // the next one it decodes; a paused one decodes nothing new by itself.
+  // the next one it decodes; a paused one decodes nothing new by itself, so
+  // it seeks where it is. That seek is the hook's own: its completion is not
+  // reported to onSeekComplete.
+  const recoverySeeks = useRef(0);
   const redecodeAfterDeviceLoss = useCallback(() => {
     if (!player || !isCurrentSession()) return;
-    if (!player.isPlaying) player.seekTo(player.currentTime);
+    if (player.isPlaying) return;
+    recoverySeeks.current += 1;
+    player.seekTo(player.currentTime);
   }, [player, isCurrentSession]);
+  const seekCompleted = useCallback(() => {
+    if (recoverySeeks.current > 0) {
+      recoverySeeks.current -= 1;
+      return;
+    }
+    onSeekComplete?.();
+  }, [onSeekComplete]);
   useEventListener(player, "ready", onReadyToPlay, isCurrentSession);
   useEventListener(
     player,
@@ -291,7 +303,12 @@ export const useVideoPlayback = ({
     onPlayingStatusChange,
     isCurrentSession,
   );
-  useEventListener(player, "seekComplete", onSeekComplete, isCurrentSession);
+  useEventListener(
+    player,
+    "seekComplete",
+    onSeekComplete ? seekCompleted : undefined,
+    isCurrentSession,
+  );
 
   useEffect(() => {
     if (autoPlay) {

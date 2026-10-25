@@ -79,7 +79,7 @@ Ni iOS ni Android ne gardent de `WGPUDevice` ou d'objet Dawn : les buffers natif
 
 - **Un export en cours échoue** plutôt que de reprendre sur le nouveau device : ses images décodées, sa cible et ses frames déjà soumises appartiennent au device perdu, et reprendre exigerait de redécoder depuis la dernière frame sûre.
 - **Pas de nouvelle API publique.** Les applications qui utilisent une portée GPU comparent `scope.device` à `getVideoGpuDevice()`, tous deux déjà publics. `getVideoGpuState()` reste interne.
-- **Un lecteur en pause est replacé à son temps courant** (`seekTo`), depuis le runtime RN : ses frames décodées sont parties avec le device, et iOS a déjà rendu leurs buffers. `useVideoPlayback` émet donc un `seekComplete`. Un lecteur en lecture n'est pas replacé : il dessine les frames suivantes, et un seek en lecture 4K sur Pixel 8a peut bloquer l'horloge (problème connu).
+- **Un lecteur en pause est replacé à son temps courant** (`seekTo`), depuis le runtime RN : ses frames décodées sont parties avec le device, et iOS a déjà rendu leurs buffers. Ce seek est celui du hook : `useVideoPlayback` ne le signale pas à `onSeekComplete` (un écouteur posé avec `player.on("seekComplete")` le reçoit encore). Un lecteur en lecture n'est pas replacé : il dessine les frames suivantes, et un seek en lecture 4K sur Pixel 8a peut bloquer l'horloge (problème connu).
 
 ## Le patch local
 

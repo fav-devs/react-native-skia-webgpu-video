@@ -11,7 +11,7 @@ Ce document liste ce qui a **réellement** été exécuté pour cette migration 
 | `apply-skia-canvas-patch.mjs` | Sur une 3.8.0 intacte : patch appliqué, puis « already applied » au second passage ; 3 fichiers, 8 éditions, empreintes de `skia-canvas-patch.json` vérifiées |
 | Syntaxe des en-têtes patchés | **Passée pour Android arm64** : `clang++` du NDK 27.1.12297006, `--target=aarch64-linux-android28 -std=c++20 -fsyntax-only -Wall`, sur `api/JsiSkSurface.h` et `api/JsiSkApi.h` (qui incluent `RNDawnContext.h`) avec les en-têtes Graphite/Dawn m157 du paquet et JSI de React Native 0.86.2, plus des références à `JsiSkApi::__rnskvGpuGeneration`, `JsiSkApi::__rnskvTrimRecorderCache`, `DawnContext::submitRecordingChecked` et `JsiSkSurface::enableCheckedSubmissions`. Aucune erreur |
 | `test-skia-patch-syntax.mjs` (simulateur iOS, `xcrun`) | **Non exécuté** : pas de SDK Apple sur l'hôte. La syntaxe Objective-C++ pour iOS n'est pas vérifiée |
-| Jest | **260/260 tests, 11 suites** (238 avant la migration, dont aucun retiré) |
+| Jest | **261/261 tests, 11 suites** (238 avant la migration, dont aucun retiré) |
 | `tsc --noEmit` | OK |
 | `test:package` | 5/5 |
 | `benchmark:test` | 121 réussis, 1 ignoré (« sync fixtures not generated »), 0 échec |

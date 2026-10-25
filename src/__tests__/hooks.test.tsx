@@ -1765,4 +1765,30 @@ describe("after a GPU device loss", () => {
     });
     expect(onError).not.toHaveBeenCalled();
   });
+
+  it("keeps a paused player's recovery seek out of onSeekComplete, and reports the app's own seeks", () => {
+    createVideoPlayer.mockImplementation(createPlayerMock);
+    const onSeekComplete = jest.fn();
+    renderHook(
+      () =>
+        useVideoPlayback({ uri: "file:///videos/clip.mp4", onSeekComplete }),
+      undefined,
+    );
+    const player = createVideoPlayer.mock.results[0]!.value as ReturnType<
+      typeof createPlayerMock
+    >;
+    const seekComplete = player.on.mock.calls.find(
+      (call) => call[0] === "seekComplete",
+    )?.[1] as () => void;
+    player.currentTime = 4;
+    player.decodeNextFrame.mockReturnValueOnce(copyOwnedFrame());
+    tick();
+    mockGpuState.generation = 2;
+    tick();
+    expect(player.seekTo).toHaveBeenCalledWith(4);
+    act(() => seekComplete());
+    expect(onSeekComplete).not.toHaveBeenCalled();
+    act(() => seekComplete());
+    expect(onSeekComplete).toHaveBeenCalledTimes(1);
+  });
 });
