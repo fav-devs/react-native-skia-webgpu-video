@@ -2,6 +2,7 @@ import RNSkiaVideoModule from "../RNSkiaVideoModule";
 import {
   checkVideoCompositionFeatures,
   getVideoCompositionFeatures,
+  legacyPlaybackRatePlayer,
 } from "../compositionFeatures";
 import type {
   VideoComposition,
@@ -26,26 +27,46 @@ const clip = (playbackRate?: number): VideoCompositionVideoItem => ({
 const compositionOf = (
   ...items: VideoComposition["items"]
 ): VideoComposition => ({ duration: 2, items });
-// An older binary: the same backend info, without the two flags.
+// An older binary: the same backend info, without the flags.
 const oldBinary = { platform: "ios", gpuDirectExport: true };
-const newBinary = { ...oldBinary, playbackRate: true, syncBackwardSeek: true };
+const newBinary = {
+  ...oldBinary,
+  playbackRate: true,
+  syncBackwardSeek: true,
+  signedPlaybackRate: true,
+};
 
 beforeEach(() => getBackendInfo.mockReset());
 
 describe("getVideoCompositionFeatures", () => {
-  it("reads both features from the native backend info", () => {
+  it("reads every feature from the native backend info", () => {
     getBackendInfo.mockReturnValue(newBinary);
     expect(getVideoCompositionFeatures()).toEqual({
       playbackRate: true,
       syncBackwardSeek: true,
+      signedPlaybackRate: true,
     });
   });
 
-  it("says neither on a binary built before them", () => {
+  it("says none on a binary built before them", () => {
     getBackendInfo.mockReturnValue(oldBinary);
     expect(getVideoCompositionFeatures()).toEqual({
       playbackRate: false,
       syncBackwardSeek: false,
+      signedPlaybackRate: false,
+    });
+  });
+
+  it("tells signed rates apart from item rates (sondr.2 and .3 binaries)", () => {
+    getBackendInfo.mockReturnValue({
+      ...oldBinary,
+      playbackRate: true,
+      syncBackwardSeek: true,
+    });
+    expect(getVideoCompositionFeatures()).toEqual({
+      playbackRate: true,
+      syncBackwardSeek: true,
+      signedPlaybackRate: false,
     });
   });
 
@@ -55,10 +76,12 @@ describe("getVideoCompositionFeatures", () => {
     getBackendInfo.mockReturnValue({
       playbackRate: "yes",
       syncBackwardSeek: 1,
+      signedPlaybackRate: "true",
     });
     expect(getVideoCompositionFeatures()).toEqual({
       playbackRate: false,
       syncBackwardSeek: false,
+      signedPlaybackRate: false,
     });
   });
 });
@@ -92,6 +115,47 @@ describe("checkVideoCompositionFeatures", () => {
       expect(() =>
         checkVideoCompositionFeatures(compositionOf(clip(rate))),
       ).not.toThrow();
+  });
+});
+
+describe("legacyPlaybackRatePlayer", () => {
+  const nativePlayer = () => ({
+    currentTime: 0,
+    isPlaying: false,
+    play: jest.fn(),
+    pause: jest.fn(),
+    seekTo: jest.fn(),
+  });
+
+  it("reads 1 and accepts 1, which is what the old native code plays at", () => {
+    const player = legacyPlaybackRatePlayer(nativePlayer());
+    expect(player).toHaveProperty("playbackRate", 1);
+    expect(() => {
+      player.playbackRate = 1;
+    }).not.toThrow();
+  });
+
+  it("refuses any other rate, backward or not, with a clear error", () => {
+    const player = legacyPlaybackRatePlayer(nativePlayer());
+    for (const rate of [-1, 0, 0.5, 2, -4])
+      expect(() => {
+        player.playbackRate = rate;
+      }).toThrow("playbackRate needs a native build");
+    expect(player.playbackRate).toBe(1);
+  });
+
+  it("leaves every other member to the native player", () => {
+    const native = nativePlayer();
+    const player = legacyPlaybackRatePlayer(native);
+    player.play();
+    player.seekTo(1.5);
+    expect(native.play).toHaveBeenCalledTimes(1);
+    expect(native.seekTo).toHaveBeenCalledWith(1.5);
+    native.currentTime = 2;
+    native.isPlaying = true;
+    expect(player.currentTime).toBe(2);
+    expect(player.isPlaying).toBe(true);
+    expect(Object.getPrototypeOf(player)).toBe(native);
   });
 });
 

@@ -8,7 +8,7 @@ import {
   type DerivedValue,
   type SharedValue,
 } from "react-native-reanimated";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   FrameDrawer,
   VideoFrame,
@@ -16,7 +16,11 @@ import type {
   VideoCompositionFramesExtractor,
 } from "./types";
 import RNSkiaVideoModule from "./RNSkiaVideoModule";
-import { checkVideoCompositionFeatures } from "./compositionFeatures";
+import {
+  checkVideoCompositionFeatures,
+  getVideoCompositionFeatures,
+  legacyPlaybackRatePlayer,
+} from "./compositionFeatures";
 import useEventListener from "./utils/useEventListener";
 import { PixelRatio } from "react-native";
 import { scheduleOnRN } from "react-native-worklets";
@@ -122,7 +126,7 @@ type UseVideoCompositionPlayerOptions<T = undefined> = {
 
 type VideoCompositionPlayerController = Pick<
   VideoCompositionFramesExtractor,
-  "currentTime" | "play" | "pause" | "seekTo" | "isPlaying"
+  "currentTime" | "play" | "pause" | "seekTo" | "isPlaying" | "playbackRate"
 >;
 
 type UseVideoCompositionPlayerReturnType = {
@@ -651,8 +655,18 @@ export const useVideoComposition = <T = undefined>({
     }
   }, true);
 
+  // The native player itself where it plays at a signed rate; on an older
+  // binary, one that refuses a rate it would ignore.
+  const player = useMemo(
+    () =>
+      framesExtractor && !getVideoCompositionFeatures().signedPlaybackRate
+        ? legacyPlaybackRatePlayer(framesExtractor)
+        : framesExtractor,
+    [framesExtractor],
+  );
+
   return {
     currentFrame,
-    player: framesExtractor,
+    player,
   };
 };

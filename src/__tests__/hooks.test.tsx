@@ -144,6 +144,8 @@ jest.mock("../RNSkiaVideoModule", () => ({
     frameProtocolVersion: 1,
     createVideoPlayer: jest.fn(),
     createVideoCompositionFramesExtractor: jest.fn(),
+    // A binary with signed rates: the hook hands out the native player.
+    getBackendInfo: jest.fn(() => ({ signedPlaybackRate: true })),
     reserveMemory: jest.fn(() => 17),
     releaseMemory: jest.fn(),
   },
@@ -152,6 +154,7 @@ jest.mock("../RNSkiaVideoModule", () => ({
 const createVideoPlayer = RNSkiaVideoModule.createVideoPlayer as jest.Mock;
 const createFramesExtractor =
   RNSkiaVideoModule.createVideoCompositionFramesExtractor as jest.Mock;
+const getBackendInfo = RNSkiaVideoModule.getBackendInfo as jest.Mock;
 const makeImage = Skia.Image.MakeFromGPUTexture as jest.Mock;
 const makeOffscreen = Skia.Surface.MakeOffscreen as jest.Mock;
 /** The player's own surfaces, without the warm-up one. */
@@ -178,6 +181,7 @@ const createPlayerMock = () => ({
 const createExtractorMock = () => ({
   isPlaying: false,
   isLooping: false,
+  playbackRate: 1,
   currentTime: 0,
   framesVersion: 0,
   decodeCompositionFrames: jest.fn<Record<string, VideoFrame>, []>(() => ({})),
@@ -1423,6 +1427,66 @@ describe("useVideoComposition", () => {
     expect(next.dispose).not.toHaveBeenCalled();
     tick();
     expect(next.decodeCompositionFrames).toHaveBeenCalledTimes(1);
+    unmount();
+  });
+
+  it("hands out the native player, playbackRate included, where it plays at a signed rate", () => {
+    const { extractor, result, rerender, drawFrame, unmount } = setup();
+    const player = result.current.player!;
+    expect(player).toBe(extractor);
+    player.playbackRate = -2;
+    expect(extractor.playbackRate).toBe(-2);
+    rerender({ composition, drawFrame, width: 100, height: 50 });
+    expect(result.current.player).toBe(player);
+    unmount();
+  });
+
+  it("refuses a signed rate on a binary without it, and passes the rest through", () => {
+    getBackendInfo.mockReturnValueOnce({ playbackRate: true });
+    const { extractor, result, rerender, drawFrame, unmount } = setup();
+    const player = result.current.player!;
+    expect(player).not.toBe(extractor);
+    expect(player.playbackRate).toBe(1);
+    expect(() => {
+      player.playbackRate = 1;
+    }).not.toThrow();
+    expect(() => {
+      player.playbackRate = -1;
+    }).toThrow("signedPlaybackRate");
+    // Nothing reached the native player, which would have played at 1×.
+    expect(extractor.playbackRate).toBe(1);
+    player.play();
+    player.seekTo(1);
+    expect(extractor.play).toHaveBeenCalledTimes(1);
+    expect(extractor.seekTo).toHaveBeenCalledWith(1);
+    extractor.currentTime = 1.25;
+    expect(player.currentTime).toBe(1.25);
+    // The same object for the session's life: effects keyed on it run once.
+    rerender({ composition, drawFrame, width: 100, height: 50 });
+    expect(result.current.player).toBe(player);
+    unmount();
+  });
+
+  it("goes idle without a complete event once playing backward stops at 0", () => {
+    const onComplete = jest.fn();
+    const { extractor, drawFrame, unmount } = setup({ onComplete });
+    extractor.playbackRate = -1;
+    extractor.isPlaying = true;
+    extractor.currentTime = 0.1;
+    tick();
+    extractor.currentTime = 0.05;
+    tick();
+    expect(drawFrame).toHaveBeenCalledTimes(2);
+    // The native clock reached the start: paused there, its first frame held.
+    extractor.isPlaying = false;
+    extractor.currentTime = 0;
+    extractor.framesVersion = 1;
+    tick();
+    tick();
+    tick();
+    expect(drawFrame).toHaveBeenCalledTimes(3);
+    expect(drawFrame.mock.calls[2]![0].currentTime).toBe(0);
+    expect(onComplete).not.toHaveBeenCalled();
     unmount();
   });
 

@@ -384,6 +384,35 @@ export type VideoCompositionFramesExtractor = {
    */
   isLooping: boolean;
   /**
+   * The signed rate `play()` plays at: composition seconds per second, `-1`
+   * plays backward at normal speed. `currentTime` moves `playbackRate` times
+   * as fast as the wall clock. Held to [-4, 4]; a value that is not a finite
+   * number throws.
+   *
+   * - Changing it while playing takes effect at once, without a seek. Only a
+   *   change of direction makes the decoders start over at the playhead (a
+   *   new reader on iOS, a codec flush on Android); a new speed in the same
+   *   direction keeps them.
+   * - `0` holds the frame on screen while staying in the playing state.
+   * - Playing backward stops at 0, holding the first frame: `isPlaying` turns
+   *   false and no `complete` event is sent. `isLooping` only applies forward.
+   * - When the decoders cannot keep up (high rates, 4K, long groups of
+   *   pictures backward), the clock still runs at the rate and the preview
+   *   shows the latest frame decoded at or behind the clock in the playing
+   *   direction, never one ahead of it.
+   * - Composition audio plays at 1× only: at any other rate it is muted.
+   *
+   * Items' own {@link VideoCompositionVideoItem.playbackRate} compose with it:
+   * a 2× item at a player rate of -1 plays its file backward at 2×.
+   *
+   * On native code built before signed rates, the player `useVideoComposition`
+   * returns reads it as 1 and throws for another value, see
+   * {@link getVideoCompositionFeatures}.
+   *
+   * @default 1
+   */
+  playbackRate: number;
+  /**
    * Events dispatched by the video composition frames extractor when the extraction is ready.
    */
   on(name: "ready", listener: () => void): () => void;
@@ -554,6 +583,8 @@ export type VideoBackendInfo = Record<string, string | number | boolean> & {
   playbackRate?: boolean;
   /** Set when the sync extractor serves earlier times, see {@link VideoCompositionFeatures}. */
   syncBackwardSeek?: boolean;
+  /** Set when the composition player plays at a signed rate, see {@link VideoCompositionFeatures}. */
+  signedPlaybackRate?: boolean;
 };
 
 /**
@@ -569,6 +600,12 @@ export type VideoCompositionFeatures = {
    * returns the frames at a time earlier than the previous call's.
    */
   syncBackwardSeek: boolean;
+  /**
+   * The composition player plays at a signed
+   * {@link VideoCompositionFramesExtractor.playbackRate}: backward, faster or
+   * slower than 1×.
+   */
+  signedPlaybackRate: boolean;
 };
 
 export type RNSkiaVideoModule = {

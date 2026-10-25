@@ -11,8 +11,33 @@ export const getVideoCompositionFeatures = (): VideoCompositionFeatures => {
   return {
     playbackRate: backend?.playbackRate === true,
     syncBackwardSeek: backend?.syncBackwardSeek === true,
+    signedPlaybackRate: backend?.signedPlaybackRate === true,
   };
 };
+
+/**
+ * The player of a binary without `signedPlaybackRate`: its native code ignores
+ * the rate and would play forward at 1×, so a rate other than 1 is refused
+ * rather than dropped. A JS object over the native one, which it keeps as its
+ * prototype: every other member is the native one's, on any runtime (worklets
+ * serialize it as they do a TurboModule). The check is the RN runtime's; a
+ * copy captured by a worklet reads 1 and keeps what it is given.
+ */
+export const legacyPlaybackRatePlayer = <T extends object>(
+  native: T,
+): T & { playbackRate: number } =>
+  Object.create(native, {
+    playbackRate: {
+      enumerable: true,
+      get: () => 1,
+      set: (rate: unknown) => {
+        if (rate !== 1)
+          throw new Error(
+            "playbackRate needs a native build of react-native-skia-webgpu-video with signedPlaybackRate; rebuild the app",
+          );
+      },
+    },
+  });
 
 /**
  * Refuses a composition the native code would play differently than asked:
