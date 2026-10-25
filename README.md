@@ -167,7 +167,7 @@ Choose a writable output path. Preview dimensions are layout points; drawing cal
 
 React Native Skia replaces a lost GPU device (a driver reset, the GPU out of memory, GPU work refused while the app is in the background on iOS) with a new one, and everything made on the lost device draws nothing from then on. The library follows the replacement on its own:
 
-- **Previews** (`useVideoComposition`, `useVideoPlayback`) skip their frames while the device is lost, then make their surface and frames again on the new device. A paused player seeks to its current time to decode its picture again, which `useVideoPlayback` reports through `onSeekComplete`.
+- **Previews** (`useVideoComposition`, `useVideoPlayback`) skip their frames while the device is lost, then make their surface and frames again on the new device. A paused player seeks to its current time to decode its picture again; that seek is the hook's own and is not reported through `onSeekComplete`.
 - **Exports** in progress reject with an error whose message starts with `Video export failed: the GPU device was lost`: the export stops at the next frame and the file is not finished. Export again; the next export uses the new device.
 - **GPU scopes** (`createVideoGpuScope`) belong to the device they were made on: once `scope.device !== getVideoGpuDevice()`, dispose the scope and make another.
 
