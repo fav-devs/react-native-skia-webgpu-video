@@ -310,7 +310,7 @@ export const imageFromVideoFrame = (frame: VideoFrame): SkImage | null => {
           );
           const data = Skia.Data.fromBytes(pixels);
           try {
-            image = Skia.Image.MakeRasterImage(
+            image = Skia.Image.MakeRaster(
               {
                 width: frame.width,
                 height: frame.height,

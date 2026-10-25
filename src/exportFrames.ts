@@ -223,7 +223,7 @@ const importYuvExportFrame = (
         region!,
         target.texture,
       );
-    entry.image = Skia.Image.MakeImageFromGPUTexture(target.texture);
+    entry.image = Skia.Image.MakeFromGPUTexture(target.texture);
     if (!entry.image) throw new Error("Cannot wrap the decoded frame");
     return entry;
   } catch (error) {
@@ -290,7 +290,7 @@ export const importExportFrame = (
     entry.texture = entry.memory.createTexture();
     entry.memory.beginAccess(entry.texture, true);
     entry.accessing = true;
-    entry.image = Skia.Image.MakeImageFromGPUTexture(entry.texture);
+    entry.image = Skia.Image.MakeFromGPUTexture(entry.texture);
     if (!entry.image) throw new Error("Cannot wrap the decoded frame");
     return entry;
   } catch (error) {

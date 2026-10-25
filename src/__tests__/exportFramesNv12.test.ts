@@ -59,7 +59,7 @@ jest.mock("../gpuDevice", () => ({
 jest.mock("react-native", () => ({ Platform: { OS: "ios" } }));
 jest.mock("react-native-skia", () => ({
   Skia: {
-    Image: { MakeImageFromGPUTexture: jest.fn(() => ({ dispose: jest.fn() })) },
+    Image: { MakeFromGPUTexture: jest.fn(() => ({ dispose: jest.fn() })) },
     Surface: { MakeFromGPUTexture: jest.fn() },
     Color: jest.fn(() => 0),
   },
@@ -87,7 +87,7 @@ describe("iOS NV12 frames in an export", () => {
     const entry = importExportFrame(frame, imports);
     expect(mockTextures).toHaveLength(1);
     expect(mockTextures[0]).toMatchObject({ width: 640, height: 360 });
-    expect(Skia.Image.MakeImageFromGPUTexture).toHaveBeenCalledWith(mockTextures[0]);
+    expect(Skia.Image.MakeFromGPUTexture).toHaveBeenCalledWith(mockTextures[0]);
     // The import ends with the submit; the buffer stays leased.
     expect(mockExternals[0]!.destroy).toHaveBeenCalled();
     expect(mockSource.release).not.toHaveBeenCalled();

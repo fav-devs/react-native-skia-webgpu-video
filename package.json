@@ -40,7 +40,7 @@
     "!**/.*",
     "scripts/apply-skia-canvas-patch.mjs",
     "scripts/skia-canvas-patch.json",
-    "patches/react-native-skia+3.7.4.patch",
+    "patches/react-native-skia+3.8.0.patch",
     "docs/UPSTREAM_NOTES.md",
     "!ios/tests",
     "!android/src/androidTest",
@@ -101,8 +101,8 @@
     "react-native": "0.86.2",
     "react-native-builder-bob": "^0.43.0",
     "react-native-reanimated": "4.5.3",
-    "react-native-skia": "3.7.4",
-    "react-native-webgpu": "0.19.0",
+    "react-native-skia": "3.8.0",
+    "react-native-webgpu": "0.19.1",
     "react-native-worklets": "0.11.3",
     "react-test-renderer": "19.2.3",
     "typescript": "^6.0.3"
@@ -111,8 +111,8 @@
     "react": ">=19",
     "react-native": ">=0.83 <0.87",
     "react-native-reanimated": "4.5.3",
-    "react-native-skia": "3.7.4",
-    "react-native-webgpu": "0.19.0",
+    "react-native-skia": "3.8.0",
+    "react-native-webgpu": "0.19.1",
     "react-native-worklets": "0.11.3"
   },
   "jest": {

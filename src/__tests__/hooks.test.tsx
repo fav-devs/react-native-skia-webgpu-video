@@ -118,7 +118,7 @@ jest.mock("react-native-skia", () => ({
       ),
     },
     Image: {
-      MakeImageFromGPUTexture: jest.fn(
+      MakeFromGPUTexture: jest.fn(
         (
           _texture: unknown,
           _width: number,
@@ -145,7 +145,7 @@ jest.mock("../RNSkiaVideoModule", () => ({
 const createVideoPlayer = RNSkiaVideoModule.createVideoPlayer as jest.Mock;
 const createFramesExtractor =
   RNSkiaVideoModule.createVideoCompositionFramesExtractor as jest.Mock;
-const makeImage = Skia.Image.MakeImageFromGPUTexture as jest.Mock;
+const makeImage = Skia.Image.MakeFromGPUTexture as jest.Mock;
 const makeOffscreen = Skia.Surface.MakeOffscreen as jest.Mock;
 /** The player's own surfaces, without the warm-up one. */
 const surfaceCalls = () =>

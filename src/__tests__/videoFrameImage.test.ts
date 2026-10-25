@@ -13,7 +13,7 @@ import type { VideoFrame } from "../types";
 jest.mock("react-native-skia", () => ({
   Skia: {
     Image: {
-      MakeImageFromGPUTexture: jest.fn(() => {
+      MakeFromGPUTexture: jest.fn(() => {
         throw new Error("Legacy imports cannot run under Graphite");
       }),
     },
@@ -26,7 +26,7 @@ jest.mock("../RNSkiaVideoModule", () => ({
   default: { frameProtocolVersion: 1 },
 }));
 
-const makeImage = Skia.Image.MakeImageFromGPUTexture as jest.Mock;
+const makeImage = Skia.Image.MakeFromGPUTexture as jest.Mock;
 
 const canvas = () => {
   const calls: unknown[][] = [];

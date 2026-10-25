@@ -22,7 +22,7 @@ jest.mock("react-native-skia", () => ({
   Skia: {
     getNativeDevice: jest.fn(() => 99n),
     Surface: { MakeFromGPUTexture: jest.fn(() => mockSurface) },
-    Image: { MakeImageFromGPUTexture: jest.fn(() => mockImage) },
+    Image: { MakeFromGPUTexture: jest.fn(() => mockImage) },
   },
 }));
 jest.mock("react-native-webgpu", () => ({
@@ -70,7 +70,7 @@ beforeEach(() => {
   (Skia.Surface.MakeFromGPUTexture as jest.Mock)
     .mockReset()
     .mockReturnValue(mockSurface);
-  (Skia.Image.MakeImageFromGPUTexture as jest.Mock)
+  (Skia.Image.MakeFromGPUTexture as jest.Mock)
     .mockReset()
     .mockReturnValue(mockImage);
   mockSurface.getCanvas.mockReset().mockReturnValue(mockCanvas);
@@ -96,7 +96,7 @@ describe("managed shared GPU scope", () => {
         format: "rgba8unorm",
       }),
     );
-    expect(Skia.Image.MakeImageFromGPUTexture).toHaveBeenCalledWith(
+    expect(Skia.Image.MakeFromGPUTexture).toHaveBeenCalledWith(
       expect.objectContaining({ nativePointer: 123n }),
     );
     expect(target.image).toBe(mockImage);

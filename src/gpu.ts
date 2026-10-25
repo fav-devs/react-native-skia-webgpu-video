@@ -166,7 +166,7 @@ export const createVideoGpuScope = (options?: {
         resource.surface = Skia.Surface.MakeFromGPUTexture(resource.texture);
         resource.canvas = getVideoCanvas(resource.surface);
       } else if (skia === "image") {
-        resource.image = Skia.Image.MakeImageFromGPUTexture(resource.texture);
+        resource.image = Skia.Image.MakeFromGPUTexture(resource.texture);
       }
       resources.push(resource);
       return {

@@ -1,0 +1,146 @@
+--- a/node_modules/react-native-skia/cpp/rnskia/RNDawnContext.h
++++ b/node_modules/react-native-skia/cpp/rnskia/RNDawnContext.h
+@@ -481,6 +481,40 @@
+     }
+     current->context->submit(syncToCpu);
+     return inserted;
++  }
++
++  // Checked only for surfaces that explicitly opt into this contract: like
++  // submitRecording, but a recording that would not run throws instead of
++  // being dropped. A valid empty Recording is accepted; Recorder::snap()
++  // returns nullptr on failure.
++  void submitRecordingChecked(
++      skgpu::graphite::Recorder *recorder,
++      skgpu::graphite::SyncToCpu syncToCpu = skgpu::graphite::SyncToCpu::kNo) {
++    if (recorder == nullptr) {
++      throw std::runtime_error(
++          "Checked GPU submissions require a Graphite recorder");
++    }
++    auto recording = recorder->snap();
++    if (recording == nullptr) {
++      throw std::runtime_error("Cannot create checked Graphite recording");
++    }
++    std::lock_guard<std::mutex> lock(_mutex);
++    auto *current = _current.load(std::memory_order_acquire);
++    if (generationOf(recorder) != current->id ||
++        current->lost.load(std::memory_order_acquire)) {
++      throw std::runtime_error(
++          "The GPU device was lost; a checked recording cannot run");
++    }
++    skgpu::graphite::InsertRecordingInfo info;
++    info.fRecording = recording.get();
++    auto status = current->context->insertRecording(info);
++    if (!static_cast<bool>(status)) {
++      throw std::runtime_error("Graphite rejected a checked recording: " +
++                               status.message());
++    }
++    if (!current->context->submit(syncToCpu)) {
++      throw std::runtime_error("Graphite checked submission failed");
++    }
+   }
+ 
+   /**
+--- a/node_modules/react-native-skia/cpp/api/JsiSkSurface.h
++++ b/node_modules/react-native-skia/cpp/api/JsiSkSurface.h
+@@ -52,6 +52,26 @@
+     }
+   }
+ 
++  // Opt-in for consumers that release native buffers after GPU completion.
++  // Other Skia surfaces preserve their existing flush/snapshot behavior.
++  void enableCheckedSubmissions() {
++    if (!getObject()->recorder()) {
++      throw std::runtime_error(
++          "Checked GPU submissions require a Graphite surface");
++    }
++    _checkedSubmissions = true;
++  }
++
++  void submitRecording(skgpu::graphite::Recorder *recorder,
++                       skgpu::graphite::SyncToCpu syncToCpu =
++                           skgpu::graphite::SyncToCpu::kNo) {
++    if (_checkedSubmissions) {
++      DawnContext::getInstance().submitRecordingChecked(recorder, syncToCpu);
++    } else {
++      DawnContext::getInstance().submitRecording(recorder, syncToCpu);
++    }
++  }
++
+   // TODO-API: Properties?
+   double width() { return static_cast<double>(getObject()->width()); }
+   double height() { return static_cast<double>(getObject()->height()); }
+@@ -85,9 +105,8 @@
+     // only Graphite-backed surfaces need to snap and submit a recording. One
+     // made on a GPU device lost since submits nothing (see DawnContext).
+     if (auto *recorder = surface->recorder()) {
+-      DawnContext::getInstance().submitRecording(
+-          recorder, sync ? skgpu::graphite::SyncToCpu::kYes
+-                         : skgpu::graphite::SyncToCpu::kNo);
++      submitRecording(recorder, sync ? skgpu::graphite::SyncToCpu::kYes
++                                     : skgpu::graphite::SyncToCpu::kNo);
+     }
+   }
+ 
+@@ -120,10 +139,15 @@
+     } else {
+       image = surface->makeImageSnapshot();
+     }
++    // A checked surface keeps the previously published image if snapshot
++    // allocation failed.
++    if (!image && _checkedSubmissions) {
++      throw jsi::JSError(runtime, "Cannot allocate Skia surface snapshot");
++    }
+     // A raster surface (e.g. Skia.Surface.Make) has no Graphite recorder; its
+     // snapshot is already a valid CPU image, so skip the recording submit.
+     if (auto *recorder = surface->recorder()) {
+-      DawnContext::getInstance().submitRecording(recorder);
++      submitRecording(recorder);
+     }
+     if (count > 1 && arguments[1].isObject()) {
+       auto jsiImage = getJsiObject<JsiSkImage>(runtime, arguments[1]);
+@@ -196,6 +220,8 @@
+                       &JsiSkSurface::makeImageSnapshot);
+     installMethod(runtime, prototype, "asImage", &JsiSkSurface::asImage);
+     installMethod(runtime, prototype, "flush", &JsiSkSurface::flush);
++    installMethod(runtime, prototype, "enableCheckedSubmissions",
++                  &JsiSkSurface::enableCheckedSubmissions);
+   }
+ 
+ protected:
+@@ -222,6 +248,7 @@
+ 
+   std::shared_ptr<Dispatcher> _dispatcher;
+   std::shared_ptr<JsiSkCanvas> _canvas;
++  bool _checkedSubmissions = false;
+ };
+ 
+ } // namespace RNSkia
+--- a/node_modules/react-native-skia/cpp/api/JsiSkApi.h
++++ b/node_modules/react-native-skia/cpp/api/JsiSkApi.h
+@@ -159,6 +159,16 @@
+   }
+   JSI_HOST_FUNCTION(Color) {
+     return JsiSkColor::createCtor()(runtime, thisValue, arguments, count);
++  }
++  // Private video-export cleanup. Only the calling thread's recorders are
++  // trimmed; the shared Context cache and other threads' recorders are
++  // untouched.
++  JSI_HOST_FUNCTION(__rnskvTrimRecorderCache) {
++    auto &context = DawnContext::getInstance();
++    context.submitRecordingChecked(context.getRecorder(),
++                                   skgpu::graphite::SyncToCpu::kYes);
++    DawnContext::trimThreadRecorders(std::chrono::milliseconds(0), true);
++    return jsi::Value::undefined();
+   }
+   JSI_HOST_FUNCTION(getNativeDevice) {
+     // Raw WGPUDevice pointer of the Graphite device, as a BigInt. Consumed by
+@@ -264,6 +274,8 @@
+   }
+ 
+   static void definePrototype(jsi::Runtime &runtime, jsi::Object &prototype) {
++    installHostMethod(runtime, prototype, "__rnskvTrimRecorderCache",
++                      &JsiSkApi::__rnskvTrimRecorderCache);
+     installHostMethod(runtime, prototype, "getNativeDevice",
+                       &JsiSkApi::getNativeDevice);
+     installGetterWithRuntime(runtime, prototype, "gpu", &JsiSkApi::getGpu);

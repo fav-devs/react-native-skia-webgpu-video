@@ -91,7 +91,7 @@ jest.mock("react-native-skia", () => ({
     },
     Color: jest.fn(() => 0),
     Data: { fromBytes: jest.fn() },
-    Image: { MakeRasterImage: jest.fn() },
+    Image: { MakeRaster: jest.fn() },
   },
   BlendMode: { Clear: 0 },
   ColorType: { RGBA_8888: 4, BGRA_8888: 6 },
@@ -119,7 +119,7 @@ const reserveMemory = RNSkiaVideoModule.reserveMemory as jest.Mock;
 const releaseMemory = RNSkiaVideoModule.releaseMemory as jest.Mock;
 const runWithAutoreleasePool =
   RNSkiaVideoModule.runWithAutoreleasePool as jest.Mock;
-const makeImage = Skia.Image.MakeRasterImage as jest.Mock;
+const makeImage = Skia.Image.MakeRaster as jest.Mock;
 const dataFromBytes = Skia.Data.fromBytes as jest.Mock;
 type Surface = ReturnType<typeof mockMakeSurface>;
 const createEncoderMock = () => ({
