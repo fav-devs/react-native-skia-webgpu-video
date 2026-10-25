@@ -1,5 +1,4 @@
 import { Skia } from "react-native-skia";
-import { importDevice } from "react-native-webgpu";
 import RNSkiaVideoModule from "../RNSkiaVideoModule";
 
 const mockCanvas = { dispose: jest.fn() };
@@ -18,15 +17,25 @@ const mockDevice = {
   queue: { onSubmittedWorkDone: jest.fn(() => Promise.resolve()) },
   destroy: jest.fn(),
 };
+// React Native Skia's device generation, negated while it is lost.
+const mockGpu = { generation: 1 };
+const mockReplacement = {
+  createTexture: jest.fn(mockTexture),
+  createBuffer: jest.fn(mockBuffer),
+  queue: { onSubmittedWorkDone: jest.fn(() => Promise.resolve()) },
+  destroy: jest.fn(),
+};
 jest.mock("react-native-skia", () => ({
   Skia: {
-    getNativeDevice: jest.fn(() => 99n),
+    __rnskvGpuGeneration: jest.fn(() => mockGpu.generation),
+    getNativeDevice: jest.fn(() =>
+      Math.abs(mockGpu.generation) > 1 ? 100n : 99n,
+    ),
     Surface: { MakeFromGPUTexture: jest.fn(() => mockSurface) },
     Image: { MakeFromGPUTexture: jest.fn(() => mockImage) },
   },
 }));
 jest.mock("react-native-webgpu", () => ({
-  importDevice: jest.fn(() => mockDevice),
   installWebGPU: jest.fn(),
   GPUTextureUsage: {
     RENDER_ATTACHMENT: 16,
@@ -44,12 +53,17 @@ jest.mock("../RNSkiaVideoModule", () => ({
     releaseMemory: jest.fn(),
   },
 }));
-// The optional GPU entry imports the native shared device during initialization.
+// The native bridge the library captures on the RN runtime.
+const mockImportDevice = jest.fn((pointer: bigint) =>
+  pointer === 99n ? mockDevice : mockReplacement,
+);
+(globalThis as unknown as Record<string, unknown>).RNWebGPU = {
+  importDevice: mockImportDevice,
+};
 const { createVideoGpuScope, getVideoGpuDevice } =
   require("../gpu") as typeof import("../gpu");
 const { nativeVideoTextureUsage } =
   require("../gpuDevice") as typeof import("../gpuDevice");
-const deviceImportCount = (importDevice as jest.Mock).mock.calls.length;
 const reserve = RNSkiaVideoModule.reserveMemory as jest.Mock;
 const release = RNSkiaVideoModule.releaseMemory as jest.Mock;
 const deferred = () => {
@@ -64,6 +78,7 @@ const flushMicrotasks = async () => {
 };
 beforeEach(() => {
   jest.clearAllMocks();
+  mockGpu.generation = 1;
   mockDevice.createTexture.mockReset().mockImplementation(mockTexture);
   mockDevice.createBuffer.mockReset().mockImplementation(mockBuffer);
   mockDevice.queue.onSubmittedWorkDone.mockReset().mockResolvedValue(undefined);
@@ -81,7 +96,8 @@ describe("managed shared GPU scope", () => {
   it("uses the one imported Skia device, requires native texture usage, and never destroys that device", async () => {
     const scope = createVideoGpuScope();
     const second = createVideoGpuScope();
-    expect(deviceImportCount).toBe(1);
+    // Imported on first use, once per runtime and device.
+    expect(mockImportDevice.mock.calls).toEqual([[99n]]);
     // Native snapshots must be copyable, as well as renderable and sampleable.
     expect(nativeVideoTextureUsage).toBe(1 | 4 | 16);
     expect(scope.device).toBe(mockDevice);
@@ -342,5 +358,76 @@ describe("managed shared GPU scope", () => {
     await scope.dispose();
     expect(release).toHaveBeenCalledTimes(2);
     expect(mockDevice.destroy).not.toHaveBeenCalled();
+  });
+});
+
+describe("GPU scope after a device loss", () => {
+  afterEach(() => {
+    mockGpu.generation = 1;
+    // Re-import the first device for the following tests.
+    getVideoGpuDevice();
+  });
+
+  it("imports the replacement device once React Native Skia replaced the lost one, and destroys neither", async () => {
+    const scope = createVideoGpuScope();
+    expect(getVideoGpuDevice()).toBe(mockDevice);
+    // Lost, not replaced yet: still the lost device; nothing is imported.
+    mockGpu.generation = -1;
+    expect(getVideoGpuDevice()).toBe(mockDevice);
+    mockGpu.generation = 2;
+    expect(getVideoGpuDevice()).toBe(mockReplacement);
+    expect(getVideoGpuDevice()).toBe(mockReplacement);
+    expect(mockImportDevice.mock.calls).toEqual([[100n]]);
+    const next = createVideoGpuScope();
+    expect(next.device).toBe(mockReplacement);
+    expect(scope.device).not.toBe(getVideoGpuDevice());
+    await scope.dispose();
+    await next.dispose();
+    expect(mockDevice.destroy).not.toHaveBeenCalled();
+    expect(mockReplacement.destroy).not.toHaveBeenCalled();
+  });
+
+  it("disposes a scope of a replaced device without waiting for that device", async () => {
+    const scope = createVideoGpuScope();
+    const target = scope.createTexture({
+      width: 4,
+      height: 2,
+      skia: "surface",
+    });
+    const work = deferred();
+    const job = scope.track(() => work.promise);
+    mockGpu.generation = 2;
+    expect(() => scope.createTexture({ width: 4, height: 2 })).toThrow(
+      "The GPU device of this scope was lost",
+    );
+    const drained = scope.drain();
+    void drained.catch(() => undefined);
+    const disposal = scope.dispose();
+    await flushMicrotasks();
+    // Tracked application work still finishes first.
+    expect(target.texture.destroy).not.toHaveBeenCalled();
+    work.resolve();
+    await job;
+    await expect(drained).rejects.toThrow(
+      "The GPU device of this scope was lost before its work completed",
+    );
+    await disposal;
+    expect(mockSurface.flush).not.toHaveBeenCalled();
+    expect(mockDevice.queue.onSubmittedWorkDone).not.toHaveBeenCalled();
+    expect(mockSurface.dispose).toHaveBeenCalledTimes(1);
+    expect(target.texture.destroy).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases resources whose fence failed because the device was lost meanwhile", async () => {
+    const scope = createVideoGpuScope();
+    const target = scope.createTexture({ width: 4, height: 2 });
+    mockDevice.queue.onSubmittedWorkDone.mockImplementationOnce(() => {
+      mockGpu.generation = -1;
+      return Promise.reject(new Error("device lost"));
+    });
+    await scope.dispose();
+    expect(target.texture.destroy).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
   });
 });

@@ -72,7 +72,14 @@ const mockPass = {
   draw: jest.fn(),
   end: jest.fn(),
 };
+// The GPU device generation React Native Skia reports (see gpuDevice.ts).
+const mockGpuState = { generation: 1, lost: false };
 jest.mock("../gpuDevice", () => ({
+  getVideoGpuState: jest.fn(() => ({ ...mockGpuState })),
+  isVideoGpuDeviceGone: jest.fn(
+    (since: { generation: number }) =>
+      mockGpuState.lost || mockGpuState.generation !== since.generation,
+  ),
   getVideoGpuDevice: () => ({
     createTexture: mockCreateTexture,
     limits: { maxTextureDimension2D: 4096 },
@@ -1934,5 +1941,108 @@ describe("owned video frame transport", () => {
     clearVideoFrameImages(true);
     expect(mockUploadTexture.destroy).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("after React Native Skia replaced its GPU device", () => {
+  afterEach(() => {
+    mockGpuState.generation = 1;
+    mockGpuState.lost = false;
+  });
+  const nativeFrame = (id: number, producerId = id): VideoFrame => ({
+    ...rgbaFrame(id, producerId),
+    texture: { kind: "native-buffer", nativeBuffer: 123n },
+  });
+
+  it("lets go of the lost device's images, scratch and retained leases without draining it, then imports on the new one", () => {
+    const paused = nativeFrame(1);
+    const image = imageFromVideoFrame(paused)!;
+    // Another producer's import fails, as on a lost device: both of its
+    // fences throw, and its leases stay retained.
+    const lost = new Error(
+      "The GPU device was lost; a checked recording cannot run",
+    );
+    mockSurface.flush
+      .mockImplementationOnce(() => {
+        throw lost;
+      })
+      .mockImplementationOnce(() => {
+        throw lost;
+      });
+    const pending = nativeFrame(2);
+    expect(() => imageFromVideoFrame(pending)).toThrow(lost);
+    const retained = mockSurface.makeImageSnapshot.mock.results[1]?.value;
+    expect(pending.dispose).not.toHaveBeenCalled();
+    expect(() => imageFromVideoFrame(nativeFrame(3))).toThrow(
+      "could not drain",
+    );
+    const flushes = mockSurface.flush.mock.calls.length;
+    const releases = release.mock.calls.length;
+    mockGpuState.generation = 2;
+    const next = nativeFrame(4, 1);
+    const replacement = imageFromVideoFrame(next);
+    expect(replacement).not.toBeNull();
+    expect(replacement).not.toBe(image);
+    // Nothing waited for the lost device: the one flush is the new import's.
+    expect(mockSurface.flush.mock.calls.length).toBe(flushes + 1);
+    expect(image.dispose).toHaveBeenCalledTimes(1);
+    expect(retained.dispose).toHaveBeenCalledTimes(1);
+    expect(pending.dispose).toHaveBeenCalledTimes(1);
+    expect(mockUploadTexture.destroy).toHaveBeenCalledTimes(1);
+    // The image, the scratch texture and the retained import.
+    expect(release.mock.calls.length).toBe(releases + 3);
+    // A new scratch texture, made on the new device.
+    expect(mockCreateTexture).toHaveBeenCalledTimes(2);
+    expect(next.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("imports a paused picture again rather than handing back its lost image", () => {
+    const first = nativeFrame(1);
+    const image = imageFromVideoFrame(first);
+    // A fresh lease of the same picture, as Android hands out while paused.
+    expect(imageFromVideoFrame(nativeFrame(1))).toBe(image);
+    expect(mockCopy).toHaveBeenCalledTimes(1);
+    mockGpuState.generation = 2;
+    const again = imageFromVideoFrame(nativeFrame(1));
+    expect(again).not.toBe(image);
+    expect(mockCopy).toHaveBeenCalledTimes(2);
+  });
+
+  it("also lets go of an Android producer's decoder buffer imports", () => {
+    withAndroidInterop(({ interop }) => {
+      mockWrapNative.mockReturnValueOnce({
+        ...mockNativeSource,
+        handle: 123n,
+        width: 8,
+        height: 4,
+        release: jest.fn(),
+      } as never);
+      const owned = {
+        ...mockNativeSource,
+        handle: 123n,
+        width: 8,
+        height: 4,
+        release: jest.fn(),
+      };
+      mockWrapNative.mockReturnValueOnce(owned as never);
+      interop.imageFromVideoFrame({
+        id: 1,
+        producerId: 1,
+        width: 8,
+        height: 4,
+        rotation: 0,
+        texture: {
+          kind: "native-buffer",
+          nativeBuffer: 123n,
+          region: { x: 0, y: 0, width: 8, height: 4 },
+        },
+        dispose: jest.fn(),
+      });
+      expect(mockYuvImports).toHaveLength(1);
+      mockGpuState.generation = 2;
+      interop.clearVideoFrameImages();
+      expect(mockYuvImports[0]!.destroy).toHaveBeenCalledTimes(1);
+      expect(owned.release).toHaveBeenCalledTimes(1);
+    });
   });
 });

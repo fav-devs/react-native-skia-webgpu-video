@@ -1,11 +1,9 @@
 --- a/node_modules/react-native-skia/cpp/rnskia/RNDawnContext.h
 +++ b/node_modules/react-native-skia/cpp/rnskia/RNDawnContext.h
-@@ -481,6 +481,40 @@
-     }
-     current->context->submit(syncToCpu);
+@@ -483,6 +483,47 @@
      return inserted;
-+  }
-+
+   }
+ 
 +  // Checked only for surfaces that explicitly opt into this contract: like
 +  // submitRecording, but a recording that would not run throws instead of
 +  // being dropped. A valid empty Recording is accepted; Recorder::snap()
@@ -38,9 +36,18 @@
 +    if (!current->context->submit(syncToCpu)) {
 +      throw std::runtime_error("Graphite checked submission failed");
 +    }
-   }
- 
++    // A wait that ended with the device lost did not run the recording to
++    // completion: what it drew must not be used.
++    if (syncToCpu == skgpu::graphite::SyncToCpu::kYes &&
++        current->lost.load(std::memory_order_acquire)) {
++      throw std::runtime_error(
++          "The GPU device was lost; a checked recording did not complete");
++    }
++  }
++
    /**
+    Replays the recordings, in order, onto the target surface (a deferred
+    canvas target) and submits them as one batch. A recording Graphite
 --- a/node_modules/react-native-skia/cpp/api/JsiSkSurface.h
 +++ b/node_modules/react-native-skia/cpp/api/JsiSkSurface.h
 @@ -52,6 +52,26 @@
@@ -118,11 +125,10 @@
  } // namespace RNSkia
 --- a/node_modules/react-native-skia/cpp/api/JsiSkApi.h
 +++ b/node_modules/react-native-skia/cpp/api/JsiSkApi.h
-@@ -159,6 +159,16 @@
-   }
+@@ -160,6 +160,24 @@
    JSI_HOST_FUNCTION(Color) {
      return JsiSkColor::createCtor()(runtime, thisValue, arguments, count);
-+  }
+   }
 +  // Private video-export cleanup. Only the calling thread's recorders are
 +  // trimmed; the shared Context cache and other threads' recorders are
 +  // untouched.
@@ -132,15 +138,26 @@
 +                                   skgpu::graphite::SyncToCpu::kYes);
 +    DawnContext::trimThreadRecorders(std::chrono::milliseconds(0), true);
 +    return jsi::Value::undefined();
-   }
++  }
++  // Private video recovery: the device in use (DawnContext::generation()),
++  // negated while it is lost and not replaced yet; 0 without a GPU. Unlike
++  // Skia.gpu, it makes no promise, so any runtime may read it.
++  JSI_HOST_FUNCTION(__rnskvGpuGeneration) {
++    const auto generation = DawnContext::generation();
++    const auto value = static_cast<double>(generation);
++    return jsi::Value(DawnContext::isCurrent(generation) ? value : -value);
++  }
    JSI_HOST_FUNCTION(getNativeDevice) {
      // Raw WGPUDevice pointer of the Graphite device, as a BigInt. Consumed by
-@@ -264,6 +274,8 @@
+     // react-native-webgpu's importDevice(), which AddRefs it; the pointer
+@@ -264,6 +282,10 @@
    }
  
    static void definePrototype(jsi::Runtime &runtime, jsi::Object &prototype) {
 +    installHostMethod(runtime, prototype, "__rnskvTrimRecorderCache",
 +                      &JsiSkApi::__rnskvTrimRecorderCache);
++    installHostMethod(runtime, prototype, "__rnskvGpuGeneration",
++                      &JsiSkApi::__rnskvGpuGeneration);
      installHostMethod(runtime, prototype, "getNativeDevice",
                        &JsiSkApi::getNativeDevice);
      installGetterWithRuntime(runtime, prototype, "gpu", &JsiSkApi::getGpu);

@@ -20,8 +20,16 @@ import useEventListener from "./utils/useEventListener";
 import { PixelRatio } from "react-native";
 import { scheduleOnRN } from "react-native-worklets";
 import { ownVideoFrames, releaseVideoFrameImage } from "./frameInterop";
+import {
+  getVideoGpuState,
+  isVideoGpuDeviceGone,
+  type VideoGpuState,
+} from "./gpuDevice";
 import { frameByteSize, reserveVideoMemory } from "./memory";
-import { disposePreviewResources } from "./previewLifecycle";
+import {
+  disposePreviewResources,
+  reclaimPreviewQuarantine,
+} from "./previewLifecycle";
 
 type UseVideoCompositionPlayerOptions<T = undefined> = {
   /**
@@ -168,6 +176,8 @@ export const useVideoComposition = <T = undefined>({
   // factory. Keep the teardown callback inside an ordinary value instead.
   const pendingAfterDraw = useSharedValue<{ run: () => void } | null>(null);
   const previousSources = useSharedValue<Record<string, VideoFrame>>({});
+  // The GPU device generation of the surface and frames (see getVideoGpuState).
+  const gpuGeneration = useSharedValue(0);
   const onCreationError = useRef(onError);
   onCreationError.current = onError;
   useEffect(() => {
@@ -224,6 +234,7 @@ export const useVideoComposition = <T = undefined>({
     sourcesGeneration,
     pendingSnapshot,
     pendingAfterDraw,
+    gpuGeneration,
   ]);
 
   const retry = useCallback(() => {
@@ -251,6 +262,13 @@ export const useVideoComposition = <T = undefined>({
     () => generation !== 0 && generation === activeOnRN.current,
     [generation],
   );
+  // The frames on screen went with a lost GPU device. A playing player draws
+  // the next ones it decodes; a paused one decodes nothing new by itself.
+  const redecodeAfterDeviceLoss = useCallback(() => {
+    if (!framesExtractor || !isCurrentSession()) return;
+    if (!framesExtractor.isPlaying)
+      framesExtractor.seekTo(framesExtractor.currentTime);
+  }, [framesExtractor, isCurrentSession]);
   useEventListener(framesExtractor, "ready", onReadyToPlay, isCurrentSession);
   useEventListener(framesExtractor, "complete", onComplete, isCurrentSession);
   useEventListener(framesExtractor, "error", errorHandler, isCurrentSession);
@@ -289,6 +307,7 @@ export const useVideoComposition = <T = undefined>({
       reservation: surfaceReservation.value,
       afterDraw: pendingAfterDraw.value?.run,
       native,
+      generation: gpuGeneration.value || undefined,
     };
     // Remove consumers before attempting a drain. A thrown drain must never
     // leave teardown callbacks able to recycle these same resources later.
@@ -351,15 +370,68 @@ export const useVideoComposition = <T = undefined>({
       frameGeneration,
       previousSources,
       sourcesGeneration,
+      gpuGeneration,
     ],
   );
+
+  /** React Native Skia replaced its lost GPU device: the surface, images and
+   * imported frames of the preview were made on that device, which runs
+   * nothing, so they go without a drain; the frame callback makes them again.
+   * Whether this session had drawn anything. */
+  const retireLostDevicePreview = (lostGeneration: number) => {
+    "worklet";
+    const drawn = frameGeneration.value === generation;
+    const retired = {
+      images: [currentFrame.value, pendingSnapshot.value],
+      surface: surfaceSharedValue.value,
+      canvas: canvasSharedValue.value,
+      reservation: surfaceReservation.value,
+      afterDraw: pendingAfterDraw.value?.run,
+      generation: lostGeneration,
+    };
+    currentFrame.value = null;
+    pendingSnapshot.value = null;
+    pendingAfterDraw.value = null;
+    frameGeneration.value = 0;
+    // Their images went with the frame import cache (see frameInterop).
+    previousSources.value = {};
+    sourcesGeneration.value = 0;
+    canvasSharedValue.value = null;
+    surfaceSharedValue.value = null;
+    surfaceReservation.value = 0;
+    surfaceWidth.value = 0;
+    surfaceHeight.value = 0;
+    lastDrawnFramesVersion.value = -1;
+    lastImportedVersion.value = -1;
+    drawDeferred.value = false;
+    importedLastVsync.value = false;
+    const failure = disposePreviewResources(retired);
+    if (failure.failed)
+      console.warn(
+        "Video preview cleanup failed after a GPU device replacement; resources remain accounted until native runtime teardown",
+        failure.error,
+      );
+    reclaimPreviewQuarantine();
+    return drawn;
+  };
 
   useFrameCallback(() => {
     "worklet";
     if (!framesExtractor || activeGeneration.value !== generation) {
       return;
     }
+    let gpu: VideoGpuState | null = null;
     try {
+      gpu = getVideoGpuState();
+      // Nothing renders on a lost device: the preview keeps its last image
+      // and decodes nothing until React Native Skia has replaced it.
+      if (gpu.lost) return;
+      const previousGpu = gpuGeneration.value;
+      if (previousGpu !== gpu.generation) {
+        gpuGeneration.value = gpu.generation;
+        if (previousGpu !== 0 && retireLostDevicePreview(previousGpu))
+          scheduleOnRN(redecodeAfterDeviceLoss);
+      }
       const pixelWidth = Math.floor(width * pixelRatio);
       const pixelHeight = Math.floor(height * pixelRatio);
 
@@ -465,6 +537,7 @@ export const useVideoComposition = <T = undefined>({
           canvas: canvasSharedValue.value,
           reservation: surfaceReservation.value,
           afterDraw: pendingAfterDraw.value?.run,
+          generation: gpu.generation,
         };
         currentFrame.value = null;
         pendingSnapshot.value = null;
@@ -568,6 +641,9 @@ export const useVideoComposition = <T = undefined>({
       lastDrawnTime.value = currentTime;
       if (inputs) lastDrawnInputs.value = inputs.map((input) => input.value);
     } catch (error) {
+      // The GPU device was lost during this frame: the next frames wait for
+      // its replacement, then draw again.
+      if (gpu && isVideoGpuDeviceGone(gpu)) return;
       activeGeneration.value = 0;
       scheduleOnRN(errorHandler, error);
     }

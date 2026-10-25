@@ -1,7 +1,14 @@
 const mockRuntimeTasks: Array<() => void> = [];
 const mockCalls: string[] = [];
 const mockImport = jest.fn();
+// The GPU device generation React Native Skia reports (see gpuDevice.ts).
+const mockGpuState = { generation: 1, lost: false };
 jest.mock("../gpuDevice", () => ({
+  getVideoGpuState: jest.fn(() => ({ ...mockGpuState })),
+  isVideoGpuDeviceGone: jest.fn(
+    (since: { generation: number }) =>
+      mockGpuState.lost || mockGpuState.generation !== since.generation,
+  ),
   getVideoGpuDevice: jest.fn(() => ({ importSharedTextureMemory: mockImport })),
   createNativeVideoGpuFrame: jest.fn((pointer: bigint) => ({
     handle: pointer + 1000n,

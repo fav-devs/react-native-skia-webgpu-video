@@ -16,7 +16,14 @@ const mockSource = {
   pixelFormat: "nv12",
   release: jest.fn(),
 };
+// The GPU device generation React Native Skia reports (see gpuDevice.ts).
+const mockGpuState = { generation: 1, lost: false };
 jest.mock("../gpuDevice", () => ({
+  getVideoGpuState: jest.fn(() => ({ ...mockGpuState })),
+  isVideoGpuDeviceGone: jest.fn(
+    (since: { generation: number }) =>
+      mockGpuState.lost || mockGpuState.generation !== since.generation,
+  ),
   getVideoGpuDevice: () => ({
     createTexture: jest.fn((descriptor: { size: { width: number; height: number } }) => {
       const texture = {

@@ -21,6 +21,7 @@ import type { VideoFrame } from "./types";
 import {
   blitNv12Frame,
   blitYuvFrame,
+  releaseYuvImport,
   releaseYuvImports,
   yuvFrameRegion,
 } from "./yuvBlit";
@@ -323,6 +324,33 @@ export const releaseExportFrames = (imports: ExportFrameImports): void => {
   }
   for (const producer of [...imports.textures.keys(), ...imports.yuv.keys()])
     releaseProducerTexture(imports, producer);
+};
+
+/** Releases every in-place frame of a session whose GPU device was lost or
+ * replaced, without the completion that releaseExportFrames needs: nothing
+ * submitted on that device can still run. Best effort, one object at a
+ * time: one that cannot close is left to its JS owner. */
+export const abandonExportFrames = (imports: ExportFrameImports): void => {
+  "worklet";
+  const attempt = (release: () => void) => {
+    "worklet";
+    try {
+      release();
+    } catch {
+      /* made on the lost device; its wrapper closes when collected */
+    }
+  };
+  for (const entry of imports.entries.values())
+    attempt(() => releaseExportFrame(entry));
+  imports.entries.clear();
+  for (const entries of imports.yuv.values())
+    for (const entry of entries) attempt(() => releaseYuvImport(entry));
+  imports.yuv.clear();
+  for (const target of imports.textures.values()) {
+    attempt(() => target.texture.destroy());
+    attempt(() => releaseVideoMemory(target.reservation));
+  }
+  imports.textures.clear();
 };
 
 /** The export counterpart of ownVideoFrames on iOS: decoded frames are drawn

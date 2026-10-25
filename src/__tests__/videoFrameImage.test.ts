@@ -1,4 +1,11 @@
+// The GPU device generation React Native Skia reports (see gpuDevice.ts).
+const mockGpuState = { generation: 1, lost: false };
 jest.mock("../gpuDevice", () => ({
+  getVideoGpuState: jest.fn(() => ({ ...mockGpuState })),
+  isVideoGpuDeviceGone: jest.fn(
+    (since: { generation: number }) =>
+      mockGpuState.lost || mockGpuState.generation !== since.generation,
+  ),
   getVideoGpuDevice: jest.fn(() => {
     throw new Error("Unexpected native import in this test");
   }),

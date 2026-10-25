@@ -71,7 +71,14 @@ const mockDevice = {
     ),
   },
 };
+// The GPU device generation React Native Skia reports (see gpuDevice.ts).
+const mockGpuState = { generation: 1, lost: false };
 jest.mock("../gpuDevice", () => ({
+  getVideoGpuState: jest.fn(() => ({ ...mockGpuState })),
+  isVideoGpuDeviceGone: jest.fn(
+    (since: { generation: number }) =>
+      mockGpuState.lost || mockGpuState.generation !== since.generation,
+  ),
   getVideoGpuDevice: jest.fn(() => mockDevice),
   createNativeVideoGpuFrame: (handle: bigint) => mockNativeFrame(handle),
   createNativeWindowGpuContext: (
@@ -497,5 +504,39 @@ describe("Android GPU export", () => {
         ([d]) => d.label === "video export source frame",
       ),
     ).toHaveLength(0);
+  });
+});
+
+describe("Android GPU export after a GPU device loss", () => {
+  afterEach(() => {
+    mockGpuState.generation = 1;
+    mockGpuState.lost = false;
+  });
+
+  it("fails when the device is lost before the window's last frame was waited for, and closes the window without waiting", async () => {
+    const { encoder, promise } = prepare();
+    encoder.finishWriting.mockImplementation(() => {
+      mockGpuState.lost = true;
+    });
+    await pumpAll();
+    await expect(promise).rejects.toThrow(
+      "Video export failed: the GPU device was lost",
+    );
+    expect(encoder.encodeFrame).toHaveBeenCalledTimes(3);
+    // No wait on the lost device after the last frame: the codec gets its
+    // buffers back, the encoder and the slots go.
+    const last = mockCalls.lastIndexOf("present");
+    expect(mockCalls.slice(last + 1)).toEqual([
+      "unconfigure",
+      "encoder.dispose",
+      "target.dispose",
+      "slot.destroy",
+      "target.dispose",
+      "slot.destroy",
+    ]);
+    expect(RNSkiaVideoModule.releaseMemory).toHaveBeenCalledTimes(2);
+    expect(
+      (globalThis as { __rnskwgpuExport?: unknown }).__rnskwgpuExport,
+    ).toBeUndefined();
   });
 });

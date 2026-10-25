@@ -1,4 +1,11 @@
+// The GPU device generation React Native Skia reports (see gpuDevice.ts).
+const mockGpuState = { generation: 1, lost: false };
 jest.mock("../gpuDevice", () => ({
+  getVideoGpuState: jest.fn(() => ({ ...mockGpuState })),
+  isVideoGpuDeviceGone: jest.fn(
+    (since: { generation: number }) =>
+      mockGpuState.lost || mockGpuState.generation !== since.generation,
+  ),
   getVideoGpuDevice: jest.fn(() => {
     throw new Error("Unexpected native import in this test");
   }),
@@ -1351,5 +1358,119 @@ describe("dedicated export recorder cleanup", () => {
     );
     expect(trimRecorderCache).toHaveBeenCalledTimes(1);
     expect(makeOffscreen).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("GPU device loss during an export", () => {
+  const lostMessage = "Video export failed: the GPU device was lost";
+  const session = () =>
+    (globalThis as { __rnskwgpuExport?: { poisoned?: boolean } })
+      .__rnskwgpuExport;
+  afterEach(() => {
+    mockGpuState.generation = 1;
+    mockGpuState.lost = false;
+  });
+
+  it("stops before drawing on a lost device, writes nothing more and releases everything without draining it", async () => {
+    const result = prepareExport();
+    result.encoder.encodeFrame.mockImplementationOnce(() => {
+      mockGpuState.lost = true;
+    });
+    await pumpAll();
+    await expect(result.promise).rejects.toThrow(lostMessage);
+    expect(result.drawFrame).toHaveBeenCalledTimes(1);
+    expect(result.encoder.encodeFrame).toHaveBeenCalledTimes(1);
+    expect(result.encoder.finishWriting).not.toHaveBeenCalled();
+    expectDisposed(result);
+    // The first frame's checked wait only: nothing waits on the lost device.
+    expect(surfaceAt().flush).toHaveBeenCalledTimes(1);
+    expect(trimRecorderCache).not.toHaveBeenCalled();
+    expect(releaseMemory).toHaveBeenCalledTimes(
+      reserveMemory.mock.calls.length,
+    );
+    expect(session()).toBeUndefined();
+    // Once React Native Skia replaced the device, the next export runs.
+    mockGpuState.lost = false;
+    mockGpuState.generation = 2;
+    const next = await runExport();
+    expect(next.encoder.finishWriting).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a checked submission refused on a lost device as the loss, with the native error as its cause", async () => {
+    const refused = new Error(
+      "The GPU device was lost; a checked recording did not complete",
+    );
+    makeOffscreen.mockImplementationOnce((width: number, height: number) => {
+      const surface = mockMakeSurface(width, height);
+      surface.flush
+        .mockImplementationOnce(() => {})
+        .mockImplementationOnce(() => {
+          mockGpuState.lost = true;
+          throw refused;
+        });
+      return surface;
+    });
+    const result = prepareExport();
+    await pumpAll();
+    const failure = await result.promise.catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain(lostMessage);
+    expect((failure as Error & { cause?: unknown }).cause).toBe(refused);
+    // The frame whose wait failed never reached the encoder.
+    expect(result.encoder.encodeFrame).toHaveBeenCalledTimes(1);
+    expectDisposed(result);
+    expect(session()).toBeUndefined();
+  });
+
+  it("does not finish a file whose device was replaced after its last frame was encoded", async () => {
+    const result = prepareExport();
+    result.encoder.encodeFrame
+      .mockImplementationOnce(() => {})
+      .mockImplementationOnce(() => {})
+      .mockImplementationOnce(() => {})
+      .mockImplementationOnce(() => {
+        mockGpuState.generation = 2;
+      });
+    await pumpAll();
+    await expect(result.promise).rejects.toThrow(lostMessage);
+    expect(result.encoder.encodeFrame).toHaveBeenCalledTimes(4);
+    expect(result.encoder.finishWriting).not.toHaveBeenCalled();
+    expectDisposed(result);
+  });
+
+  it("fails before allocating anything while the device is lost", async () => {
+    mockGpuState.lost = true;
+    const result = prepareExport();
+    await pumpAll();
+    await expect(result.promise).rejects.toThrow(lostMessage);
+    expect(makeOffscreen).not.toHaveBeenCalled();
+    expect(createVideoEncoder).not.toHaveBeenCalled();
+    expect(session()).toBeUndefined();
+  });
+
+  it("lets a session kept after a failed drain go once its device was replaced", async () => {
+    const failure = new Error("processor disposal failed");
+    const first = prepareExport({
+      createFrameProcessor: () => ({
+        prepareFrame: jest.fn(),
+        dispose: jest.fn(async () => {
+          throw failure;
+        }),
+      }),
+    });
+    await pumpAll();
+    await expect(first.promise).rejects.toBe(failure);
+    expect(session()?.poisoned).toBe(true);
+    expect(releaseMemory).not.toHaveBeenCalled();
+    const flushes = surfaceAt(0).flush.mock.calls.length;
+    mockGpuState.generation = 2;
+    const next = await runExport();
+    expect(next.encoder.finishWriting).toHaveBeenCalledTimes(1);
+    // The kept surface and its reservations went first, without a drain.
+    expect(surfaceAt(0).dispose).toHaveBeenCalledTimes(1);
+    expect(surfaceAt(0).flush).toHaveBeenCalledTimes(flushes);
+    expect(releaseMemory).toHaveBeenCalledTimes(
+      reserveMemory.mock.calls.length,
+    );
   });
 });

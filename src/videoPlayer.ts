@@ -14,9 +14,17 @@ import type {
 } from "./types";
 import RNSkiaVideoModule from "./RNSkiaVideoModule";
 import { imageFromVideoFrame, releaseVideoFrameImage } from "./frameInterop";
+import {
+  getVideoGpuState,
+  isVideoGpuDeviceGone,
+  type VideoGpuState,
+} from "./gpuDevice";
 import { runOnUI } from "react-native-reanimated";
 import { scheduleOnRN } from "react-native-worklets";
-import { disposePreviewResources } from "./previewLifecycle";
+import {
+  disposePreviewResources,
+  reclaimPreviewQuarantine,
+} from "./previewLifecycle";
 
 type UseVideoPlayerOptions = {
   /**
@@ -152,6 +160,8 @@ export const useVideoPlayback = ({
   const currentFrame = useSharedValue<null | VideoFrame>(null);
   const activeGeneration = useSharedValue(0);
   const frameGeneration = useSharedValue(0);
+  // The GPU device generation of the current frame (see getVideoGpuState).
+  const gpuGeneration = useSharedValue(0);
   const onCreationError = useRef(onError);
   onCreationError.current = onError;
   useEffect(() => {
@@ -189,7 +199,11 @@ export const useVideoPlayback = ({
           frameGeneration.value = 0;
           if (frame) frames.push(frame);
         }
-        const failure = disposePreviewResources({ frames, native: created });
+        const failure = disposePreviewResources({
+          frames,
+          native: created,
+          generation: gpuGeneration.value || undefined,
+        });
         if (failure.failed)
           console.warn(
             "Video preview cleanup failed; resources remain accounted until native runtime teardown",
@@ -209,6 +223,7 @@ export const useVideoPlayback = ({
     currentFrame,
     activeGeneration,
     frameGeneration,
+    gpuGeneration,
   ]);
 
   const retry = useCallback(() => {
@@ -248,6 +263,12 @@ export const useVideoPlayback = ({
     () => generation !== 0 && generation === activeOnRN.current,
     [generation],
   );
+  // The frame on screen went with a lost GPU device. A playing player shows
+  // the next one it decodes; a paused one decodes nothing new by itself.
+  const redecodeAfterDeviceLoss = useCallback(() => {
+    if (!player || !isCurrentSession()) return;
+    if (!player.isPlaying) player.seekTo(player.currentTime);
+  }, [player, isCurrentSession]);
   useEventListener(player, "ready", onReadyToPlay, isCurrentSession);
   useEventListener(
     player,
@@ -285,7 +306,23 @@ export const useVideoPlayback = ({
     // Polled while paused too: decodeNextFrame returns null at almost no cost
     // when nothing new was decoded, and the frame produced by a seek performed
     // while paused only shows up if it gets picked up here.
+    let gpu: VideoGpuState | null = null;
     try {
+      gpu = getVideoGpuState();
+      // Nothing renders on a lost device: wait for its replacement.
+      if (gpu.lost) return;
+      if (gpuGeneration.value !== gpu.generation) {
+        const replaced = gpuGeneration.value !== 0;
+        gpuGeneration.value = gpu.generation;
+        reclaimPreviewQuarantine();
+        if (replaced && frameGeneration.value === generation) {
+          // Its image was made on the replaced device and went with the
+          // frame import cache (see frameInterop).
+          currentFrame.value = null;
+          frameGeneration.value = 0;
+          scheduleOnRN(redecodeAfterDeviceLoss);
+        }
+      }
       const nextFrame = player.decodeNextFrame();
       if (nextFrame) {
         const image = imageFromVideoFrame(nextFrame);
@@ -306,6 +343,9 @@ export const useVideoPlayback = ({
         }
       }
     } catch (error) {
+      // The GPU device was lost during this frame: the next frames wait for
+      // its replacement, then show again.
+      if (gpu && isVideoGpuDeviceGone(gpu)) return;
       activeGeneration.value = 0;
       scheduleOnRN(errorHandler, error);
     }

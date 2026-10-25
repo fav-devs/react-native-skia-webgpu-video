@@ -25,6 +25,9 @@ export type YuvImport = {
 };
 
 type YuvBlit = {
+  /** The device these were made on: once React Native Skia replaced it
+   * (see getVideoGpuDevice), the next blit makes them again. */
+  device: GPUDevice;
   layout: GPUBindGroupLayout;
   pipelineLayout: GPUPipelineLayout;
   sampler: GPUSampler;
@@ -121,7 +124,8 @@ const getYuvBlit = (device: GPUDevice): YuvBlit => {
   const runtime = globalThis as typeof globalThis & {
     __rnskwgpuYuvBlit?: YuvBlit;
   };
-  if (!runtime.__rnskwgpuYuvBlit) {
+  if (runtime.__rnskwgpuYuvBlit?.device !== device) {
+    // Made on a lost device, which runs nothing: it goes with that device.
     const layout = device.createBindGroupLayout({
       label: "video YUV blit",
       entries: [
@@ -143,6 +147,7 @@ const getYuvBlit = (device: GPUDevice): YuvBlit => {
       ],
     });
     runtime.__rnskwgpuYuvBlit = {
+      device,
       layout,
       pipelineLayout: device.createPipelineLayout({
         label: "video YUV blit",

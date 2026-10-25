@@ -48,11 +48,17 @@ import {
 } from "./exportTarget";
 import { yieldToRuntime } from "./runtimeYield";
 import {
+  abandonExportFrames,
   createExportFrameImports,
   ownExportFrames,
   releaseExportFrames,
   type ExportFrameImports,
 } from "./exportFrames";
+import {
+  getVideoGpuState,
+  isVideoGpuDeviceGone,
+  type VideoGpuState,
+} from "./gpuDevice";
 
 export type VideoFrameProcessingContext = {
   frames: Record<string, VideoFrame>;
@@ -155,6 +161,8 @@ type ExportState = {
   unchecked?: boolean;
   reservations: number[];
   index: number;
+  /** The GPU device the session draws with, read before anything is made. */
+  device?: VideoGpuState;
   setupError?: unknown;
   poisoned?: boolean;
   hasRecorder?: boolean;
@@ -176,6 +184,72 @@ const runWithVideoAutoreleasePool = <T>(fn: () => T): T => {
   return (
     RNSkiaVideoModule.runWithAutoreleasePool ?? ((body: () => T) => body())
   )(fn);
+};
+
+const deviceLostMessage =
+  "Video export failed: the GPU device was lost (a driver reset, the GPU out of memory, or GPU work refused while the app is in the background). React Native Skia replaces it; export again.";
+
+/** What an export rejects with once Skia's GPU device was lost during it:
+ * the export stops at the next frame and does not finish the file. */
+const exportDeviceLostError = (cause?: unknown): Error => {
+  "worklet";
+  const error = new Error(deviceLostMessage) as Error & { cause?: unknown };
+  if (cause !== undefined) error.cause = cause;
+  return error;
+};
+
+const isExportDeviceLostError = (error: unknown): boolean => {
+  "worklet";
+  return error instanceof Error && error.message === deviceLostMessage;
+};
+
+// Declared before its callers: worklets capture their closure on creation.
+/** Releases a session whose GPU device was lost or replaced: nothing it
+ * submitted can still run, so nothing is drained first and nothing is kept
+ * in quarantine. Best effort, one object at a time. */
+const abandonExportState = (state: ExportState): void => {
+  "worklet";
+  const attempt = (release: () => void) => {
+    "worklet";
+    try {
+      runWithVideoAutoreleasePool(release);
+    } catch {
+      /* made on the lost device; its wrapper closes when collected */
+    }
+  };
+  const afterDraw = state.pendingAfterDraw;
+  state.pendingAfterDraw = null;
+  if (afterDraw) attempt(afterDraw);
+  attempt(() => state.extractor?.dispose());
+  state.extractor = null;
+  const window = state.window;
+  if (window) attempt(() => closeEncoderWindow(window));
+  attempt(() => state.encoder?.dispose());
+  state.encoder = null;
+  for (const frame of Object.values(state.frames))
+    attempt(() => frame.dispose?.());
+  state.frames = {};
+  const imports = state.imports;
+  if (imports) attempt(() => abandonExportFrames(imports));
+  state.imports = null;
+  attempt(() => clearVideoFrameImages(true));
+  attempt(() => state.surface?.dispose());
+  state.surface = null;
+  state.canvas = null;
+  // The target, if any, is one of the window's slots.
+  if (window) attempt(() => releaseEncoderWindow(window));
+  else {
+    const target = state.target;
+    if (target) attempt(() => closeEncoderTarget(target));
+  }
+  state.window = null;
+  state.target = null;
+  // React Native Skia gives the thread a recorder for the new device.
+  state.hasRecorder = false;
+  for (const reservation of state.reservations)
+    attempt(() => releaseVideoMemory(reservation));
+  state.reservations = [];
+  state.readback = null;
 };
 
 /** Public drawing/timing contract preserved; one step is submitted at a time.
@@ -318,6 +392,32 @@ const executeExport = <T>(args: VideoExportArguments<T>): Promise<void> =>
         failed = false,
       ) => {
         "worklet";
+        // The device was lost or replaced: nothing submitted on it can still
+        // run, and nothing can be drained. Release without the drains.
+        if (state.device && isVideoGpuDeviceGone(state.device)) {
+          // The Android window's last frame had not been waited for yet.
+          const lost = failed || !!state.unchecked;
+          state.unchecked = false;
+          try {
+            await state.processor?.dispose();
+          } catch {
+            /* its resources belong to the lost device too */
+          }
+          state.processor = null;
+          abandonExportState(state);
+          delete storage.__rnskwgpuExport;
+          scheduleOnRN(
+            settle,
+            !lost
+              ? null
+              : isExportDeviceLostError(error)
+                ? error
+                : exportDeviceLostError(error ?? undefined),
+            aborted || isCancelled(),
+            lost,
+          );
+          return;
+        }
         const cleanup = { failure: error, failed, safeToRelease: true };
         // A rejected adapter drain cannot prove that it stopped reading
         // our pixels. Retain/account that session instead of recycling them.
@@ -421,6 +521,9 @@ const executeExport = <T>(args: VideoExportArguments<T>): Promise<void> =>
         "worklet";
         try {
           if ("setupError" in state) throw state.setupError;
+          // Nothing drawn on a lost device reaches the file.
+          if (state.device && isVideoGpuDeviceGone(state.device))
+            throw exportDeviceLostError();
           lap("yieldMs");
           if (isCancelled()) {
             await finish(null, true);
@@ -605,6 +708,8 @@ const executeExport = <T>(args: VideoExportArguments<T>): Promise<void> =>
             return false;
           }
           if (state.index === nbFrames) {
+            if (state.device && isVideoGpuDeviceGone(state.device))
+              throw exportDeviceLostError();
             runWithVideoAutoreleasePool(() => state.encoder!.finishWriting());
             lap("encodeMs");
             if (profile && onProfile) {
@@ -645,6 +750,17 @@ const executeExport = <T>(args: VideoExportArguments<T>): Promise<void> =>
         const storage = globalThis as typeof globalThis & {
           __rnskwgpuExport?: ExportState;
         };
+        const previous = storage.__rnskwgpuExport;
+        // A session kept after a failed drain can go once the GPU device it
+        // drew with was lost: none of its work can still run.
+        if (
+          previous?.poisoned &&
+          previous.device &&
+          isVideoGpuDeviceGone(previous.device)
+        ) {
+          abandonExportState(previous);
+          delete storage.__rnskwgpuExport;
+        }
         if (storage.__rnskwgpuExport) {
           scheduleOnRN(
             settle,
@@ -681,6 +797,8 @@ const executeExport = <T>(args: VideoExportArguments<T>): Promise<void> =>
             }
             runWithVideoAutoreleasePool(() => {
               assertExportRecorderCacheSupport();
+              state.device = getVideoGpuState();
+              if (state.device.lost) throw exportDeviceLostError();
               const allocateReadback = () => {
                 // Render target + transient full-frame CPU readback. Native decoder
                 // and encoder reservations are additional entries in the same budget.

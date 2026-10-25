@@ -1,4 +1,11 @@
+// The GPU device generation React Native Skia reports (see gpuDevice.ts).
+const mockGpuState = { generation: 1, lost: false };
 jest.mock("../gpuDevice", () => ({
+  getVideoGpuState: jest.fn(() => ({ ...mockGpuState })),
+  isVideoGpuDeviceGone: jest.fn(
+    (since: { generation: number }) =>
+      mockGpuState.lost || mockGpuState.generation !== since.generation,
+  ),
   getVideoGpuDevice: jest.fn(() => {
     throw new Error("Unexpected native import in this test");
   }),
@@ -1518,5 +1525,244 @@ describe("useVideoComposition", () => {
     expect(unmount).not.toThrow();
     expect(mockSurface.dispose).toHaveBeenCalledTimes(1);
     warning.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GPU device loss: React Native Skia replaces a lost device with a new one.
+// ---------------------------------------------------------------------------
+
+describe("after a GPU device loss", () => {
+  afterEach(() => {
+    mockGpuState.generation = 1;
+    mockGpuState.lost = false;
+  });
+
+  it("waits while the device is lost, then remakes a paused composition preview on the replacement without draining the lost one", () => {
+    mockSerializedRuntime = createSerializedUiRuntime();
+    const extractor = mockSerializedRuntime.host(createExtractorMock());
+    extractor.decodeCompositionFrames.mockReturnValue({
+      clip: copyOwnedFrame(),
+    });
+    extractor.currentTime = 1.5;
+    createFramesExtractor.mockReturnValue(extractor);
+    const drawn = mockSerializedRuntime.host(jest.fn());
+    const drawFrame = () => {
+      "worklet";
+      drawn();
+    };
+    const onError = jest.fn();
+    const rendered = renderHook(
+      () =>
+        useVideoComposition({
+          composition,
+          width: 320,
+          height: 180,
+          drawFrame,
+          onError,
+        }),
+      undefined,
+    );
+    tick();
+    expect(drawn).toHaveBeenCalledTimes(1);
+    const lostImage = rendered.result.current.currentFrame.value as unknown as {
+      dispose: jest.Mock;
+    };
+
+    // Lost and not replaced yet: nothing is decoded nor drawn.
+    mockGpuState.lost = true;
+    const decodes = extractor.decodeCompositionFrames.mock.calls.length;
+    tick();
+    tick();
+    expect(drawn).toHaveBeenCalledTimes(1);
+    expect(extractor.decodeCompositionFrames).toHaveBeenCalledTimes(decodes);
+    expect(mockSurface.dispose).not.toHaveBeenCalled();
+
+    mockGpuState.lost = false;
+    mockGpuState.generation = 2;
+    const flushes = mockSurface.flush.mock.calls.length;
+    tick();
+    expect(onError).not.toHaveBeenCalled();
+    // The lost surface and image go without a drain; the new ones are drawn.
+    expect(lostImage.dispose).toHaveBeenCalledTimes(1);
+    expect(mockSurface.dispose).toHaveBeenCalledTimes(1);
+    expect(surfaceCalls()).toHaveLength(2);
+    expect(drawn).toHaveBeenCalledTimes(2);
+    expect(mockSurface.flush.mock.calls.length).toBe(flushes + 1);
+    expect(rendered.result.current.currentFrame.value).not.toBe(lostImage);
+    // Paused: its picture is decoded again, from the RN runtime.
+    expect(extractor.seekTo).toHaveBeenCalledWith(1.5);
+    // Then the paused preview skips again until something changes.
+    tick();
+    expect(drawn).toHaveBeenCalledTimes(2);
+    rendered.unmount();
+    expect(extractor.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets a playing composition draw the frames it decodes next, without seeking", () => {
+    const extractor = createExtractorMock();
+    extractor.isPlaying = true;
+    createFramesExtractor.mockReturnValue(extractor);
+    const drawFrame = jest.fn();
+    renderHook(
+      () =>
+        useVideoComposition({ composition, drawFrame, width: 10, height: 10 }),
+      undefined,
+    );
+    tick();
+    mockGpuState.generation = 2;
+    tick();
+    expect(drawFrame).toHaveBeenCalledTimes(2);
+    expect(extractor.seekTo).not.toHaveBeenCalled();
+  });
+
+  it("does not report a frame that failed because the device was lost meanwhile, and draws again once it was replaced", () => {
+    const extractor = createExtractorMock();
+    createFramesExtractor.mockReturnValue(extractor);
+    const onError = jest.fn();
+    const drawFrame = jest.fn();
+    renderHook(
+      () =>
+        useVideoComposition({
+          composition,
+          drawFrame,
+          width: 10,
+          height: 10,
+          onError,
+        }),
+      undefined,
+    );
+    mockSurface.flush.mockImplementationOnce(() => {
+      mockGpuState.lost = true;
+      throw new Error(
+        "The GPU device was lost; a checked recording did not complete",
+      );
+    });
+    tick();
+    expect(onError).not.toHaveBeenCalled();
+    tick();
+    expect(drawFrame).toHaveBeenCalledTimes(1);
+    mockGpuState.lost = false;
+    mockGpuState.generation = 2;
+    tick();
+    expect(onError).not.toHaveBeenCalled();
+    expect(drawFrame).toHaveBeenCalledTimes(2);
+    // A failure on a live device is still the app's to handle.
+    const failure = new Error("drawer failed");
+    drawFrame.mockImplementationOnce(() => {
+      throw failure;
+    });
+    extractor.framesVersion++;
+    tick();
+    expect(onError).toHaveBeenCalledWith(failure, expect.any(Function));
+  });
+
+  it("releases a preview quarantined on the lost device once it was replaced", () => {
+    const extractor = createExtractorMock();
+    createFramesExtractor.mockReturnValue(extractor);
+    const warning = jest.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const rendered = renderHook(
+        () =>
+          useVideoComposition({
+            composition,
+            drawFrame: jest.fn(),
+            width: 10,
+            height: 10,
+          }),
+        undefined,
+      );
+      tick();
+      mockSurface.flush.mockImplementationOnce(() => {
+        throw new Error("GPU fence unavailable");
+      });
+      rendered.unmount();
+      const quarantine = (
+        globalThis as { __rnskwgpuPreviewQuarantine?: unknown[] }
+      ).__rnskwgpuPreviewQuarantine!;
+      expect(quarantine).toHaveLength(1);
+      expect(mockSurface.dispose).not.toHaveBeenCalled();
+      // Another preview's next frame, on the replacement device.
+      createFramesExtractor.mockReturnValue(createExtractorMock());
+      renderHook(
+        () =>
+          useVideoComposition({
+            composition,
+            drawFrame: jest.fn(),
+            width: 10,
+            height: 10,
+          }),
+        undefined,
+      );
+      tick();
+      mockGpuState.generation = 2;
+      tick();
+      expect(quarantine).toHaveLength(0);
+      expect(mockSurface.dispose).toHaveBeenCalled();
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it("releases a preview unmounted after the replacement without draining the lost device", () => {
+    createFramesExtractor.mockReturnValue(createExtractorMock());
+    const rendered = renderHook(
+      () =>
+        useVideoComposition({
+          composition,
+          drawFrame: jest.fn(),
+          width: 10,
+          height: 10,
+        }),
+      undefined,
+    );
+    tick();
+    const flushes = mockSurface.flush.mock.calls.length;
+    // A checked drain on the lost device's surface would throw.
+    mockSurface.flush.mockImplementation(() => {
+      throw new Error(
+        "The GPU device was lost; a checked recording cannot run",
+      );
+    });
+    mockGpuState.generation = 2;
+    rendered.unmount();
+    expect(mockSurface.flush.mock.calls.length).toBe(flushes);
+    expect(mockSurface.dispose).toHaveBeenCalledTimes(1);
+    expect(RNSkiaVideoModule.releaseMemory).toHaveBeenCalledTimes(1);
+    expect(
+      (globalThis as { __rnskwgpuPreviewQuarantine?: unknown[] })
+        .__rnskwgpuPreviewQuarantine,
+    ).toBeUndefined();
+  });
+
+  it("drops a single player's lost frame and decodes a paused one again", () => {
+    createVideoPlayer.mockImplementation(createPlayerMock);
+    const onError = jest.fn();
+    const rendered = renderHook(
+      () => useVideoPlayback({ uri: "file:///videos/clip.mp4", onError }),
+      undefined,
+    );
+    const player = createVideoPlayer.mock.results[0]!.value as ReturnType<
+      typeof createPlayerMock
+    >;
+    player.currentTime = 4;
+    player.decodeNextFrame.mockReturnValueOnce(copyOwnedFrame());
+    tick();
+    expect(rendered.result.current.currentFrame.value).not.toBeNull();
+    mockGpuState.lost = true;
+    tick();
+    expect(player.decodeNextFrame).toHaveBeenCalledTimes(1);
+    mockGpuState.lost = false;
+    mockGpuState.generation = 2;
+    tick();
+    expect(rendered.result.current.currentFrame.value).toBeNull();
+    expect(player.seekTo).toHaveBeenCalledWith(4);
+    const next = copyOwnedFrame();
+    player.decodeNextFrame.mockReturnValueOnce(next);
+    tick();
+    expect(rendered.result.current.currentFrame.value).toMatchObject({
+      texture: next.texture,
+    });
+    expect(onError).not.toHaveBeenCalled();
   });
 });

@@ -6,6 +6,7 @@ import type { VideoFrame } from "./types";
 import type { NativeVideoFrame } from "react-native-webgpu";
 import {
   getVideoGpuDevice,
+  getVideoGpuState,
   createNativeVideoGpuFrame,
   nativeVideoTextureUsage,
   rgbaVideoTextureUsage,
@@ -18,6 +19,7 @@ import {
 import {
   blitNv12Frame,
   blitYuvFrame,
+  releaseYuvImport,
   releaseYuvImports,
   yuvFrameRegion,
 } from "./yuvBlit";
@@ -56,6 +58,8 @@ type PendingSource = {
   nativeSource?: NativeVideoFrame | null;
 };
 type Cache = {
+  /** The GPU device generation everything below was made on. */
+  generation: number;
   images: Map<number, Entry>;
   stage: SkSurface | null;
   canvas: SkCanvas | null;
@@ -76,13 +80,54 @@ type Cache = {
 // worklet. iOS keeps its existing native-buffer and RGBA compatibility paths.
 const uploadAndroidRgba = Platform.OS === "android";
 
+/** Everything the cache holds was made on a GPU device that React Native
+ * Skia has since replaced: none of its work can still run, so it is let go
+ * without the drains a live device needs, leases a failed drain retained
+ * included. Best effort: an object that cannot close is left to its JS
+ * owner, and the pixels are gone either way. */
+const abandonCache = (cache: Cache) => {
+  "worklet";
+  const attempt = (release: () => void) => {
+    "worklet";
+    try {
+      release();
+    } catch {
+      /* made on the lost device; its wrapper closes when collected */
+    }
+  };
+  for (const source of cache.pendingSources) {
+    attempt(() => source.owned?.dispose());
+    attempt(() => source.nativeSource?.release());
+    if (!source.sourceReleased) attempt(() => source.frame.dispose?.());
+    attempt(() => releaseVideoMemory(source.reservation));
+  }
+  for (const entry of cache.images.values()) {
+    attempt(() => entry.image?.dispose());
+    attempt(() => releaseVideoMemory(entry.reservation));
+  }
+  for (const entries of cache.yuvImports.values())
+    for (const entry of entries) attempt(() => releaseYuvImport(entry));
+  cache.canvas = null;
+  attempt(() => cache.stage?.dispose());
+  attempt(() => cache.uploadTexture?.destroy());
+  attempt(() => releaseVideoMemory(cache.uploadReservation));
+  attempt(() => releaseVideoMemory(cache.cpuReservation));
+};
+
 const getCache = (): Cache => {
   "worklet";
   const runtime = globalThis as typeof globalThis & {
     __rnskwgpuFrames?: Cache;
   };
+  const { generation } = getVideoGpuState();
+  const previous = runtime.__rnskwgpuFrames;
+  if (previous && previous.generation !== generation) {
+    runtime.__rnskwgpuFrames = undefined;
+    abandonCache(previous);
+  }
   if (!runtime.__rnskwgpuFrames) {
     runtime.__rnskwgpuFrames = {
+      generation,
       images: new Map(),
       stage: null,
       canvas: null,

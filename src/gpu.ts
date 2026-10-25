@@ -4,7 +4,7 @@ import type { SkCanvas, SkImage, SkSurface } from "react-native-skia";
 import { GPUTextureUsage } from "react-native-webgpu";
 import { getVideoCanvas } from "./canvas";
 import { releaseVideoMemory, reserveVideoMemory } from "./memory";
-import { getVideoGpuDevice } from "./gpuDevice";
+import { getVideoGpuDevice, getVideoGpuState } from "./gpuDevice";
 export { getVideoGpuDevice } from "./gpuDevice";
 
 export type VideoGpuTextureFormat =
@@ -30,6 +30,11 @@ export type VideoGpuTextureOptions = {
   skia?: "image" | "surface" | "none";
   label?: string;
 };
+/** A scope belongs to the device it was made on. React Native Skia replaces
+ * a lost GPU device with a new one, after which everything made on the lost
+ * device draws nothing: once `scope.device !== getVideoGpuDevice()`, dispose
+ * the scope, which no longer waits for the GPU, and make another. Meanwhile
+ * it makes nothing new, and `drain()` rejects. */
 export type VideoGpuScope = {
   readonly device: GPUDevice;
   createTexture: (options: VideoGpuTextureOptions) => VideoGpuTarget;
@@ -60,6 +65,8 @@ export const createVideoGpuScope = (options?: {
   maxPendingJobs?: number;
 }): VideoGpuScope => {
   "worklet";
+  // In this order: a device replaced in between reads as lost at once.
+  const { generation } = getVideoGpuState();
   const device = getVideoGpuDevice();
   const maxResources = options?.maxResources ?? 32;
   const maxPendingJobs = options?.maxPendingJobs ?? 32;
@@ -85,9 +92,19 @@ export const createVideoGpuScope = (options?: {
     closing: false,
     disposal: null as Promise<void> | null,
   };
+  /** The scope's device was lost: nothing it submitted can still run. */
+  const deviceLost = () => {
+    "worklet";
+    const gpu = getVideoGpuState();
+    return gpu.lost || gpu.generation !== generation;
+  };
   const ensureCapacity = () => {
     "worklet";
     if (state.closing) throw new Error("GPU scope is closing");
+    if (deviceLost())
+      throw new Error(
+        "The GPU device of this scope was lost; dispose it and create another",
+      );
     if (resources.length >= maxResources)
       throw new Error("GPU scope resource limit exceeded");
   };
@@ -97,18 +114,24 @@ export const createVideoGpuScope = (options?: {
     // other concurrent reads have finished.
     for (;;) {
       while (state.pendingCount) await Promise.all([...pending]);
-      const generation = state.jobGeneration;
+      const jobs = state.jobGeneration;
+      // A lost device runs nothing more, and waiting for it proves nothing.
+      if (deviceLost()) return false;
       for (const resource of resources) resource.surface?.flush(true);
       await device.queue.onSubmittedWorkDone();
       // drain() leaves the scope open. A job registered while awaiting the GPU
       // may submit further work after this fence; await that job and a new fence.
-      if (!state.pendingCount && state.jobGeneration === generation) return;
+      if (!state.pendingCount && state.jobGeneration === jobs) return true;
     }
   };
   const drain = async () => {
     "worklet";
-    await drainGpu();
+    const completed = await drainGpu();
     if (state.hasJobFailure) throw state.jobFailure;
+    if (!completed)
+      throw new Error(
+        "The GPU device of this scope was lost before its work completed",
+      );
   };
   const createTexture = (opts: VideoGpuTextureOptions): VideoGpuTarget => {
     "worklet";
@@ -255,8 +278,13 @@ export const createVideoGpuScope = (options?: {
     state.disposal = (async () => {
       "worklet";
       // If this fence fails, preserve all resources rather than destroy any
-      // texture whose pending native use can no longer be established.
-      await drainGpu();
+      // texture whose pending native use can no longer be established. A
+      // device lost meanwhile has no pending use left.
+      try {
+        await drainGpu();
+      } catch (error) {
+        if (!deviceLost()) throw error;
+      }
       let failure: unknown;
       let hasFailure = false;
       for (let i = resources.length - 1; i >= 0; i--) {
