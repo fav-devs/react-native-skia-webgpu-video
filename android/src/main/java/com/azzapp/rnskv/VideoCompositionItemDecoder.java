@@ -258,10 +258,24 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
       return;
     }
 
-    int sampleSize = extractor.readSampleData(inputBuffer, 0);
+    // This runs on the codec's callback thread, where an uncaught exception
+    // kills the process: a sample larger than the input buffer (a
+    // high-bitrate file) makes readSampleData throw, for one. Failures end
+    // the item's input and go to its error listener instead.
+    int sampleSize;
+    try {
+      sampleSize = extractor.readSampleData(inputBuffer, 0);
+    } catch (Throwable e) {
+      failInput(e);
+      return;
+    }
     if (sampleSize <= 0) {
-      this.codec.queueInputBuffer(index, 0, 0, 0,
-        MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+      try {
+        this.codec.queueInputBuffer(index, 0, 0, 0,
+          MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+      } catch (Throwable e) {
+        failInput(e);
+      }
       return;
     }
     try {
@@ -275,8 +289,30 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
     } catch (Throwable e) {
       return;
     }
-    extractor.advance();
-    inputEOS = extractor.getSampleTime() == -1;
+    try {
+      extractor.advance();
+      inputEOS = extractor.getSampleTime() == -1;
+    } catch (Throwable e) {
+      failInput(e);
+    }
+  }
+
+  /** Stops feeding the codec after `error`, and reports it once. */
+  private void failInput(Throwable error) {
+    inputEOS = true;
+    reportError(error);
+  }
+
+  private void reportError(Throwable error) {
+    if (released || onErrorListener == null) {
+      return;
+    }
+    try {
+      onErrorListener.onError(
+        error instanceof Exception ? (Exception) error : new RuntimeException(error));
+    } catch (Throwable ignored) {
+      // A listener's own failure must not take the codec thread down either.
+    }
   }
 
   @Override
@@ -300,7 +336,11 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
       frame.presentationTimeUs = info.presentationTimeUs;
       pendingFrames.add(frame);
       if (onFrameAvailableListener != null) {
-        onFrameAvailableListener.onFrameAvailable(frame.presentationTimeUs);
+        try {
+          onFrameAvailableListener.onFrameAvailable(frame.presentationTimeUs);
+        } catch (Throwable e) {
+          reportError(e);
+        }
       }
     } else {
       try {
@@ -313,19 +353,18 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
     itemEndReached = outputEOS || sampleOutOfBounds;
     if (itemEndReached) {
       if (onEndReachedListener != null) {
-        onEndReachedListener.onEndReached();
+        try {
+          onEndReachedListener.onEndReached();
+        } catch (Throwable e) {
+          reportError(e);
+        }
       }
     }
   }
 
   @Override
   public void onError(@NonNull MediaCodec codec, @NonNull MediaCodec.CodecException e) {
-    if (released) {
-      return;
-    }
-    if (onErrorListener != null) {
-      onErrorListener.onError(e);
-    }
+    reportError(e);
   }
 
   @Override
