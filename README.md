@@ -6,8 +6,8 @@
   <a href="https://github.com/batical/react-native-skia-webgpu-video/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/batical/react-native-skia-webgpu-video/actions/workflows/ci.yml/badge.svg?branch=main" /></a>
   <a href="https://www.npmjs.com/package/react-native-skia-webgpu-video"><img alt="npm" src="https://img.shields.io/npm/v/react-native-skia-webgpu-video/beta" /></a>
   <a href="#status"><img alt="Status: beta" src="https://img.shields.io/badge/status-beta-f59e0b" /></a>
-  <img alt="React Native Skia 3.7.4" src="https://img.shields.io/badge/Skia-3.7.4-38bdf8" />
-  <img alt="React Native WebGPU 0.19.0" src="https://img.shields.io/badge/WebGPU-0.19.0-a78bfa" />
+  <img alt="React Native Skia 3.8.0" src="https://img.shields.io/badge/Skia-3.8.0-38bdf8" />
+  <img alt="React Native WebGPU 0.19.1" src="https://img.shields.io/badge/WebGPU-0.19.1-a78bfa" />
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-34d399" /></a>
 </p>
 
@@ -27,7 +27,7 @@ A new Skia 3 / WebGPU frame-interop layer, written from scratch with explicit re
 - **Audio compositions** with clip audio, separate tracks, and per-item volume.
 - **Custom GPU processing** through an export frame processor and an optional WebGPU resource scope.
 
-> **Beta.** The Skia 3.7.4 / WebGPU 0.19.0 build has run on an iPhone 15 Pro and a Pixel 8a (export speed, pixel checks, native and instrumented tests, smoke runs). Not yet qualified: memory over long sessions (last checked on 3.0.6), HDR, audible output and A/V synchronization; two 4K cases have known issues. See [status](#status) before adopting this in production.
+> **Beta.** The Skia 3.7.4 / WebGPU 0.19.0 build has run on an iPhone 15 Pro and a Pixel 8a (export speed, pixel checks, native and instrumented tests, smoke runs). The move to Skia 3.8.0 / WebGPU 0.19.1, which renames Skia factory methods and follows GPU device loss, has only run on the host so far ([3.8.0 verification](migration/skia-3.8.0/verification.md)). Not yet qualified: memory over long sessions (last checked on 3.0.6), HDR, audible output and A/V synchronization; two 4K cases have known issues. See [status](#status) before adopting this in production.
 
 ## Installation
 
@@ -37,8 +37,8 @@ A new Skia 3 / WebGPU frame-interop layer, written from scratch with explicit re
 | --- | --- |
 | React Native | `0.86.2` tested; declared peer range `>=0.83 <0.87` |
 | React | `19.2.3` tested |
-| React Native Skia | **`react-native-skia@3.7.4`** |
-| React Native WebGPU | **`react-native-webgpu@0.19.0`** (both resolve `react-native-webgpu-dawn@157.0.0`) |
+| React Native Skia | **`react-native-skia@3.8.0`** |
+| React Native WebGPU | **`react-native-webgpu@0.19.1`** (both resolve `react-native-webgpu-dawn@157.0.0`) |
 | Reanimated / Worklets | **`4.5.3` / `0.11.3`** |
 | Native runtime | New Architecture and Hermes |
 | Android | API **28+**, Vulkan 1.1 (declared as a required feature by Skia) |
@@ -52,7 +52,7 @@ On ProMotion iPhones, add `CADisableMinimumFrameDurationOnPhone` (Boolean, `YES`
 The beta is published on npm under the `beta` tag:
 
 ```sh
-npm install --save-exact react-native-skia@3.7.4 react-native-webgpu@0.19.0 react-native-reanimated@4.5.3 react-native-worklets@0.11.3
+npm install --save-exact react-native-skia@3.8.0 react-native-webgpu@0.19.1 react-native-reanimated@4.5.3 react-native-worklets@0.11.3
 npm install --save-exact react-native-skia-webgpu-video@beta
 ```
 
@@ -71,7 +71,7 @@ module.exports = {
 
 ### Apply the required Skia patch
 
-This package includes a version-checked Skia patch for canvas/image-provider ownership, checked GPU submissions and cleanup of the dedicated export recorder cache. Apply it in the **application**, before compiling native code:
+This package includes a version-checked Skia patch for checked GPU submissions, cleanup of the dedicated export recorder cache and a query of the GPU device in use that any runtime can make. Apply it in the **application**, before compiling native code:
 
 ```sh
 npx --no-install skia-video-patch-canvas
@@ -162,6 +162,16 @@ export function VideoEditor({ inputPath, outputPath }: {
 ```
 
 Choose a writable output path. Preview dimensions are layout points; drawing callbacks receive physical pixel dimensions. Export dimensions are pixels. The [`useVideoPlayback`](src/videoPlayer.ts) hook is also available for single-video playback.
+
+### GPU device loss
+
+React Native Skia replaces a lost GPU device (a driver reset, the GPU out of memory, GPU work refused while the app is in the background on iOS) with a new one, and everything made on the lost device draws nothing from then on. The library follows the replacement on its own:
+
+- **Previews** (`useVideoComposition`, `useVideoPlayback`) skip their frames while the device is lost, then make their surface and frames again on the new device. A paused player seeks to its current time to decode its picture again, which `useVideoPlayback` reports through `onSeekComplete`.
+- **Exports** in progress reject with an error whose message starts with `Video export failed: the GPU device was lost`: the export stops at the next frame and the file is not finished. Export again; the next export uses the new device.
+- **GPU scopes** (`createVideoGpuScope`) belong to the device they were made on: once `scope.device !== getVideoGpuDevice()`, dispose the scope and make another.
+
+Images and surfaces the app makes itself with Skia are its own to remake, with Skia's `useGpu()` hook or `Skia.gpu.lost` on the RN runtime. Do not read `Skia.gpu` in a worklet: its `lost` promise settles on the RN runtime only. See the [migration guide](docs/MIGRATION.md#gpu-device-loss).
 
 ### Export speed
 
@@ -277,7 +287,7 @@ Reproduce on your devices with the example app: `node scripts/test-ios-device-ab
 | Frame accuracy | At 60 Hz, the preview draws the frame due at 99–100% of vsyncs in 30, 24 and 60 fps on both phones, and 97–100% in 4K with `yuv` frames on the Pixel 8a. On a warm iPhone at 120 Hz: 73–95% in 1080p, 77–90% in 4K 60 fps. Every exported frame holds the right source frame, in both frame pixel formats ([beta.3 verification](docs/VERIFICATION_0.1.0-beta.3.md)). |
 | iOS | iPhone 15 Pro: 61/61 benchmark cases pass with `yuv` frames, including the three that stopped on the video memory budget with BGRA ([beta.3 verification](docs/VERIFICATION_0.1.0-beta.3.md)). With Skia 3.7.4: 56/58 native XCTests pass, the other two being opt-in diagnostics, and the smoke profile passes in 8 of 9 runs. The one failure, a preview frame import refused right after a launch on a locked phone, did not come back ([3.7.4 verification](migration/skia-3.7.4/verification.md#reste-à-faire)). |
 | Android | Pixel 8a, beta.4: CPU vs GPU decode comparison 10/10 cases (max channel error 1, including rotation, portrait and 4K); export checks of a color pattern and of a decoded rotated clip match CPU readback. The EGL-free export writes the same bytes as beta.3's (Rec.709, limited range) ([3.7.4 verification](migration/skia-3.7.4/verification.md)). Instrumented tests: 126/127; the failure, a 4K preview throughput test, fails the same way on beta.3. |
-| JavaScript / types | 238 tests in 11 suites, typecheck, package tests and 122 benchmark-harness tests pass; CI runs them on every pull request. |
+| JavaScript / types | 260 tests in 11 suites, typecheck, package tests and 122 benchmark-harness tests pass (one of them skips without generated sync fixtures); CI runs them on every pull request. |
 | Image / audio fidelity | Sampled SDR pixels and an exported color pattern are checked on Android; iOS exported files have the same byte size as with 3.0.6. Whole-image fidelity, HDR, audible output and A/V synchronization remain unqualified. |
 | Known issues | On Pixel 8a: a seek while playing a 4K sequence leaves the clock stalled, a paused seek into a 120-clip lazy montage does not show its frame, and Android 17 reports a missing file in words the harness does not recognize; all three predate beta.3. An iOS export with `yuv` frames spends 2–4 ms more per frame than with `rgba`. With `ImageReader`, 1:1 exports are 5–16% larger files for matching sampled pixels. |
 | Long sessions | Not yet re-run since 3.0.6; the 3.0.6 results below are the latest. |

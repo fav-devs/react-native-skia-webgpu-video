@@ -71,9 +71,29 @@ On Android with the AHardwareBuffer interop (API 29+, 8-bit SDR H.264/HEVC), the
 
 The optional `createFrameProcessor` export factory creates a processor once per export. Its asynchronous `prepareFrame` runs at the requested composition timestamp and its `dispose` must finish all frame readers. Drive animated effects from that timestamp, not an independent display animation loop.
 
-For GPU work, create `createVideoGpuScope` on the runtime that uses it. The Skia device is shared: do not destroy it or pass command encoders across runtimes. Track asynchronous work before starting it, remove images from consumers, and await `scope.dispose()`. CPU/ML inference needs its own tracked completion; a graphics fence does not finish unrelated inference.
+For GPU work, create `createVideoGpuScope` on the runtime that uses it. The Skia device is shared: do not destroy it or pass command encoders across runtimes. Track asynchronous work before starting it, remove images from consumers, and await `scope.dispose()`. CPU/ML inference needs its own tracked completion; a graphics fence does not finish unrelated inference. A scope belongs to one GPU device: see [GPU device loss](#gpu-device-loss).
 
 If completion cannot be established after an error, the library can retain the affected state and reject later work to avoid releasing resources still in use. Zero tracked reservations alone is not proof that all process or GPU memory has been returned.
+
+## GPU device loss
+
+React Native Skia (since 3.7.3) replaces a lost GPU device with a new one: a driver reset, the GPU out of memory, or GPU work refused while the app is in the background on iOS. Everything made on the lost device stays safe to use but draws nothing: offscreen surfaces and their snapshots, texture images, and the device `Skia.getNativeDevice()` returned. Before this release, the library imported that device once, at load: after a loss its previews stayed blank until the app restarted.
+
+The library now follows the replacement on every runtime it uses (RN, Reanimated UI, its export runtime):
+
+- `getVideoGpuDevice()` returns the device in use, imported again on each runtime once it was replaced. While the device is lost and not replaced yet, it is still the lost one.
+- `useVideoComposition` and `useVideoPlayback` draw nothing while the device is lost and do not report the frames that failed because of it through `onError`. Once it is replaced they make their surface and frames again. A paused player seeks to its current time, since its decoded frames went with the lost device: `useVideoPlayback` then calls `onSeekComplete`. A playing player draws the next frames it decodes. `currentFrame` of `useVideoPlayback` reads `null` until then.
+- `exportVideoComposition` rejects an export during which the device was lost or replaced. The message starts with `Video export failed: the GPU device was lost`, and `error.cause` holds the native error when there was one. The export stops at the next frame and does not finish the file: delete it and export again. The export runtime stays usable.
+- A `createVideoGpuScope` scope keeps the device it was made on. Once `scope.device !== getVideoGpuDevice()`, its resources draw nothing: dispose it (it no longer waits for the lost device) and create another. Until then it refuses new resources, and `drain()` rejects.
+- On Android, the AHardwareBuffer interop is negotiated again with the new device's features. Decoders opened before keep their transport.
+
+What the app must still do:
+
+- Remake its own Skia objects that live on the GPU (`makeTextureImage()` images, offscreen surfaces, `Skia.Image.MakeFromGPUTexture` images, its own WebGPU device imports) when Skia's `useGpu()` hook re-renders or `Skia.gpu.lost` resolves.
+- Read `Skia.gpu` on the RN runtime only. Its `lost` promise is created for the runtime that reads it first and settles on the RN runtime; a worklet reading it would share that promise across runtimes.
+- Retry an export that failed with the message above, once the app is back in the foreground on iOS.
+
+The device generation the library follows comes from a query the Skia patch adds (`Skia.__rnskvGpuGeneration`): apply the 3.8.0 patch and rebuild, or `getVideoGpuDevice()` throws that the GPU recovery patch is missing.
 
 ## Application validation
 
