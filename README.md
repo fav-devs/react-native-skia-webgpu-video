@@ -211,6 +211,31 @@ const { playbackRate, syncBackwardSeek } = getVideoCompositionFeatures();
 
 `syncBackwardSeek` says whether a sync extractor's `decodeCompositionFrames(time)` serves a time earlier than its previous call; older binaries return the previous frames.
 
+### Shuttle: playing backward and at other speeds
+
+The player `useVideoComposition` returns has a signed `playbackRate`, held to −4…4: `-1` plays backward at normal speed, `2` forward at twice it, `0` holds the frame while staying in the playing state. A timeline drag can shuttle the preview by setting it from the drag's velocity:
+
+```ts
+// Drag start, then at every drag update.
+player.playbackRate = velocity; // seconds of composition per second, signed
+player.play();
+// Release: the exact frame.
+player.pause();
+player.playbackRate = 1;
+player.seekTo(time);
+```
+
+- A change while playing takes effect at once, without a seek: `currentTime` moves `playbackRate` times as fast as the wall clock. Only a change of direction makes the decoders start over at the playhead (a new reader on iOS, a codec flush on Android); a new speed in the same direction keeps them, so a rate set 30 times a second costs nothing more.
+- Playing backward stops at 0 and holds the first frame: `isPlaying` turns false and no `complete` event is sent. `isLooping` only loops forward; forward, the end completes and loops as before.
+- Composition audio (`audio: true` items, audio items) plays at 1× only: at any other rate it is muted. Play clip sound with players of your own while shuttling.
+- Items' own `playbackRate` composes with it: a 2× item at a player rate of −1 plays its file backward at 2×.
+
+Decoders only read forward, so backward each item decodes **windows** of its file behind the playhead: from the sync sample (key frame) before the window's start, keeping the window's frames at the preview's decode size (`maxLongSide` and `resolution` apply), shown in reverse as the clock goes back over them while the next window, earlier in the file, is decoded. Windows follow the file's groups of pictures when they fit (AVSampleCursor on iOS, MediaExtractor's sync seeks on Android). An item holds at most two windows, 32 frames or 64 MB, whichever is lower (two 10-frame windows at 1080p NV12 on iOS, two 4-frame windows of 1080p RGBA on Android), counted against `configureVideoMemory`'s budget; frames are released as soon as the clock passes them, and everything on a pause, a seek or a change of direction. On Android a window's frames are copied out of the codec one at a time, by the thread that draws the preview: at most one frame per item per display refresh.
+
+When the decoders cannot keep up (high rates, 4K, long groups of pictures backward), the clock still runs at the rate: the preview shows the latest frame decoded at or behind the clock in the playing direction, never one ahead of it. Once the clock has run below what is decoded, the next backward window starts at the clock rather than decoding the stretch in between. Forward faster than 1×, a decoder that falls half a second of wall time behind the clock is sought to it.
+
+`getVideoCompositionFeatures().signedPlaybackRate` says whether the native code plays at a signed rate. On a binary without it, the player reads `playbackRate` as 1 and throws when given another value, rather than playing forward at 1×.
+
 ## Migrating from Skia Video
 
 Use `useVideoComposition` for timelines and `useVideoPlayback` for single videos. Rename the previous hook imports and calls; the old names are no longer exported. Composition structure, timeline units, drawing callbacks, and player/export controls are retained. Texture interop changes: replace `MakeImageFromNativeTextureUnstable(frame.texture)` with `drawVideoFrame` or `makeVideoFrameImage`.
