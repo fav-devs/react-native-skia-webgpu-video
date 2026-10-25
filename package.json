@@ -1,6 +1,6 @@
 {
   "name": "react-native-skia-webgpu-video",
-  "version": "0.1.0-beta.4-sondr.2",
+  "version": "0.1.0-beta.4-sondr.3",
   "description": "Bounded video composition, playback and export for React Native Skia 3 / Graphite",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
