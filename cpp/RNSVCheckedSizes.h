@@ -51,4 +51,13 @@ inline double checkedMediaSeconds(double seconds) {
   }
   return seconds;
 }
+
+// An item's playbackRate: source seconds per composition second. Zero would
+// hold one frame and needs a reader range of its own; not supported.
+inline double checkedPlaybackRate(double rate) {
+  if (!std::isfinite(rate) || rate <= 0) {
+    throw std::invalid_argument("Invalid playbackRate: expected a finite number above 0");
+  }
+  return rate;
+}
 } // namespace RNSkiaVideo

@@ -99,6 +99,29 @@ int main() {
     runtime->global().setProperty(*runtime, "encoder", jsi::Value::undefined());
     encoder.reset();
 
+    // playbackRate is a finite number above 0, and only on silent items: the
+    // audio track would still play at 1×.
+    auto parse = [&](const std::string& fields) {
+      auto source = "({duration:1,items:[{id:'a',path:'/private/tmp/unused.mp4',"
+                    "compositionStartTime:0,startTime:0,duration:1" + fields + "}]})";
+      auto object = runtime->evaluateJavaScript(
+          std::make_shared<jsi::StringBuffer>(source), "playback-rate").asObject(*runtime);
+      return VideoComposition::fromJS(*runtime, object);
+    };
+    for (const auto& fields : {",playbackRate:0", ",playbackRate:-1", ",playbackRate:NaN",
+                               ",playbackRate:Infinity", ",playbackRate:'2'", ",playbackRate:null",
+                               ",playbackRate:2,audio:true", ",playbackRate:2,audio:{volume:1}",
+                               ",kind:'audio',playbackRate:0.5", ",startTime:1e9,playbackRate:1e10"}) {
+      bool refused = false;
+      try { parse(fields); } catch (const std::exception&) { refused = true; }
+      check(refused, "invalid or audible playbackRate refused");
+      if (!refused) std::cerr << fields << '\n';
+    }
+    check(parse("")->items[0]->playbackRate == 1, "playbackRate defaults to 1");
+    check(parse(",playbackRate:undefined")->items[0]->playbackRate == 1, "undefined is the default");
+    check(parse(",playbackRate:0.5")->items[0]->playbackRate == 0.5, "playbackRate parsed");
+    check(parse(",playbackRate:1,audio:true")->items[0]->playbackRate == 1, "1x audio accepted");
+
     NSString* path = [NSString stringWithFormat:@"/private/tmp/rnskv-validation-%d.mp4", getpid()];
     [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
     try {

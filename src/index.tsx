@@ -10,6 +10,7 @@ export * from './exportVideoComposition';
 export * from './videoFrameImage';
 export { clearVideoFrameImages, releaseVideoFrameImage } from './frameInterop';
 export { configureVideoMemory, getVideoResourceStats } from './memory';
+export { getVideoCompositionFeatures } from './compositionFeatures';
 export type { VideoMemoryStats } from './memory';
 
 export const getValidEncoderConfigurations: typeof RNSkiaVideoModule.getValidEncoderConfigurations =

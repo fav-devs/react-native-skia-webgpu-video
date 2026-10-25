@@ -78,6 +78,15 @@ VideoComposition::fromJSIObject(jsi::Runtime& runtime,
         checkedMediaSeconds(jsItem.getProperty(runtime, "compositionStartTime").asNumber());
     auto startTime = checkedMediaSeconds(jsItem.getProperty(runtime, "startTime").asNumber());
     auto duration = checkedMediaSeconds(jsItem.getProperty(runtime, "duration").asNumber());
+    double playbackRate = 1;
+    if (jsItem.hasProperty(runtime, "playbackRate")) {
+      auto rateProp = jsItem.getProperty(runtime, "playbackRate");
+      if (!rateProp.isUndefined()) {
+        playbackRate = checkedPlaybackRate(
+            rateProp.isNumber() ? rateProp.asNumber() : std::numeric_limits<double>::quiet_NaN());
+      }
+    }
+    checkedMediaSeconds(startTime + duration * playbackRate);
 
     auto item = VideoCompositionItem::create(id, path, compositionStartTime,
                                              startTime, duration);
@@ -144,6 +153,11 @@ VideoComposition::fromJSIObject(jsi::Runtime& runtime,
     item->setFieldValue(itemCls->getField<jboolean>("audioEnabled"),
                         (jboolean)audioEnabled);
     item->setFieldValue(itemCls->getField<jdouble>("audioVolume"), audioVolume);
+    // The audio track is still played and mixed at 1×: refused rather than
+    // drifting away from its picture.
+    if (audioEnabled && playbackRate != 1)
+      throw jsi::JSError(runtime, "playbackRate is only supported on silent video items");
+    item->setFieldValue(itemCls->getField<jdouble>("playbackRate"), playbackRate);
 
     items->add(item);
   }

@@ -1,5 +1,6 @@
 #pragma once
 
+#import "ItemTime.h"
 #import "SeekPolicy.h"
 #import "VideoComposition.h"
 #import "VideoFrame.h"
@@ -51,6 +52,8 @@ private:
   std::atomic<bool> released{false};
 
   void setupReader(CMTime initialTime);
+  /** The file time the item plays over a span of composition time. */
+  CMTime sourceSpan(CMTime compositionSpan) const;
   /** Drops the reader and its decoded frames, keeping the issued ones. */
   void discardReader();
   std::shared_ptr<VideoFrame> makeFrame(CVPixelBufferRef buffer,

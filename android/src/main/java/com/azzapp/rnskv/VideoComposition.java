@@ -70,6 +70,8 @@ public class VideoComposition {
     private double compositionStartTime;
     private double startTime;
     private double duration;
+    // Source seconds per composition second, set from native code; see ItemTime.
+    private double playbackRate = 1;
     private int width = -1;
     private int height = -1;
     private int maxLongSide = -1;
@@ -114,6 +116,29 @@ public class VideoComposition {
 
     public double getDuration() {
       return duration;
+    }
+
+    /**
+     * @return the source seconds played per composition second. The item
+     * reads {@code getDuration() * getPlaybackRate()} seconds of its file.
+     */
+    public double getPlaybackRate() {
+      return playbackRate;
+    }
+
+    /**
+     * @return the file time shown at a composition time, not held to the item
+     */
+    public long sourceTimeUs(long compositionTimeUs) {
+      return TimeHelpers.secToUs(startTime) + ItemTime.sourceSpanUs(
+        compositionTimeUs - TimeHelpers.secToUs(compositionStartTime), playbackRate);
+    }
+
+    /**
+     * @return where the item's range of the file ends
+     */
+    public long sourceEndUs() {
+      return TimeHelpers.secToUs(startTime + duration * playbackRate);
     }
 
     public int getWidth() {

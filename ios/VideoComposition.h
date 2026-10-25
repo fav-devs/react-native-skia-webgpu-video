@@ -16,6 +16,12 @@ public:
   double compositionStartTime;
   double startTime;
   double duration;
+  /**
+   * Source seconds played per composition second, see ItemTime.h. `duration`
+   * stays the composition duration; the item reads `duration * playbackRate`
+   * seconds of its file.
+   */
+  double playbackRate = 1;
   CGSize resolution;
   /**
    * Cap for the longest side of the decoded frames, or 0 for the file's own
@@ -98,8 +104,16 @@ public:
           checkedMediaSeconds(jsItem.getProperty(runtime, "compositionStartTime").asNumber());
       item->startTime = checkedMediaSeconds(jsItem.getProperty(runtime, "startTime").asNumber());
       item->duration = checkedMediaSeconds(jsItem.getProperty(runtime, "duration").asNumber());
-      checkedMediaSeconds(item->startTime + item->duration);
       checkedMediaSeconds(item->compositionStartTime + item->duration);
+      if (jsItem.hasProperty(runtime, "playbackRate")) {
+        auto rateProp = jsItem.getProperty(runtime, "playbackRate");
+        if (!rateProp.isUndefined()) {
+          item->playbackRate = checkedPlaybackRate(
+              rateProp.isNumber() ? rateProp.asNumber()
+                                  : std::numeric_limits<double>::quiet_NaN());
+        }
+      }
+      checkedMediaSeconds(item->startTime + item->duration * item->playbackRate);
       item->yuvFrames = yuvFrames;
       item->resolution = CGSize();
       if (jsItem.hasProperty(runtime, "resolution")) {
@@ -158,6 +172,11 @@ public:
           }
         }
       }
+
+      // The audio track is still played and mixed at 1×: refused rather than
+      // drifting away from its picture.
+      if (item->audioEnabled && item->playbackRate != 1)
+        throw jsi::JSError(runtime, "playbackRate is only supported on silent video items");
 
       composition->items.push_back(item);
     }

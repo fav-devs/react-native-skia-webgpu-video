@@ -300,6 +300,11 @@ RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(install) {
             result.setProperty(rt, "nativeFrameCapacity", 2);
             result.setProperty(rt, "encoderPoolCapacity", 3);
             result.setProperty(rt, "gpuDirectExport", true);
+            // What this native code implements, for JS shipped ahead of a
+            // rebuilt app: an older binary has neither and would play every
+            // item at 1×. See getVideoCompositionFeatures.
+            result.setProperty(rt, "playbackRate", true);
+            result.setProperty(rt, "syncBackwardSeek", true);
             return jsi::Value(std::move(result));
           }));
   runtime.global().setProperty(runtime, "RNSkiaVideo", RNSVModule);

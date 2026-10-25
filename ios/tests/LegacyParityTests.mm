@@ -275,12 +275,14 @@ struct Clip {
   double compositionStart;
   double start;
   double duration;
+  /** The item's playbackRate: file seconds per composition second. */
+  double rate = 1;
 
   double end() const { return compositionStart + duration; }
   bool covers(double t) const { return t >= compositionStart && t < end(); }
   /** The index of the file frame shown at composition time t. */
   int frameAt(double t, int fps) const {
-    double source = start + std::max(t - compositionStart, 0.0);
+    double source = start + std::max(t - compositionStart, 0.0) * rate;
     return (int)floor(source * fps + 1e-6);
   }
 };
@@ -309,6 +311,7 @@ std::shared_ptr<VideoCompositionItem> makeItem(NSString* path,
   item->compositionStartTime = clip.compositionStart;
   item->startTime = clip.start;
   item->duration = clip.duration;
+  item->playbackRate = clip.rate;
   item->resolution = CGSizeZero;
   return item;
 }
@@ -643,6 +646,22 @@ struct FrameView {
   }
 }
 
+// playbackRate: the export asks at the composition's frame rate, the decoder
+// skips or repeats file frames. 6 s of composition read 3 s of file at 0.5×,
+// 3 s read the whole 6 s file at 2×.
+- (void)testEveryFrameAtHalfSpeed {
+  [self walkClip:{"a", 0, 0, 6, 0.5} spec:VideoSpec()];
+}
+
+- (void)testEveryFrameAtDoubleSpeed {
+  [self walkClip:{"a", 0, 0, 3, 2} spec:VideoSpec()];
+}
+
+- (void)testEveryFrameOfARetimedItemInTheMiddleOfItsFile {
+  [self walkClip:{"b", 1, 1.5, 2, 2} spec:VideoSpec()];
+  [self walkClip:{"b", 1, 1.5, 2, 0.5} spec:VideoSpec()];
+}
+
 // framePixelFormat: 'yuv': the same frames, handed over in the decoder's NV12.
 - (void)testEveryFrameOfASingleItemInNV12 {
   [self walkClip:{"a", 0, 0, 6} spec:VideoSpec() yuv:true];
@@ -835,6 +854,32 @@ struct FrameView {
 - (void)testPlayThroughEveryItemOfAMontage {
   for (const auto& clip : kMontage) {
     [self playClip:clip spec:VideoSpec()];
+  }
+}
+
+// At 2× a 60 Hz vsync is one 30 fps file frame: every frame is decoded in
+// time, read-ahead included. At 0.5× each file frame is shown four times.
+- (void)testPlayThroughAtHalfSpeed {
+  [self playClip:{"a", 0, 0, 6, 0.5} spec:VideoSpec()];
+}
+
+- (void)testPlayThroughAtDoubleSpeed {
+  [self playClip:{"a", 0, 0, 3, 2} spec:VideoSpec()];
+}
+
+- (void)testSeeksAtDoubleSpeed {
+  Clip clip{"a", 0, 0, 3, 2};
+  [self open:clip spec:VideoSpec()];
+  [self tick:0];
+  XCTAssertEqual([self seek:2.25], 135, "forward");
+  XCTAssertEqual([self seek:0.5], 30, "backward");
+  // Read on: 0.4 s of composition is 0.8 s of file, under kSeekReadOnSeconds.
+  XCTAssertEqual([self seek:0.9], clip.frameAt(0.9, 30), "a short step");
+  XCTAssertEqual([self seek:2.99], 179, "near the end");
+  // And it plays on from a seek, two file frames a composition frame.
+  [self seek:1.0];
+  for (double t = 1.0; t < 1.5; t += 1 / 60.0) {
+    XCTAssertEqual([self tick:t], clip.frameAt(t, 30), @"at %.4fs", t);
   }
 }
 
@@ -1350,6 +1395,56 @@ static int slowMotionFrameAt(double t) {
   auto frames = [self decode:extractor at:0.5];
   XCTAssertEqual(frames["present"].index, present.frameAt(0.5, 30));
   XCTAssertFalse(frames.count("gone"));
+}
+
+/*
+ * The export asks for times in order, but an app reading frames for a reverse
+ * clip or a backward scrub asks for earlier ones: each is the frame at its own
+ * time, not the one decoded last.
+ */
+- (void)testABackwardRequestGivesTheEarlierFrame {
+  Clip clip{"a", 0, 0, 6};
+  auto extractor =
+      [self start:makeComposition([self video:VideoSpec()], {clip}, false)];
+  XCTAssertEqual([self decode:extractor at:3.0]["a"].index, 90);
+  XCTAssertEqual([self decode:extractor at:1.0]["a"].index, 30, "backward");
+  XCTAssertEqual([self decode:extractor at:1.37]["a"].index,
+                 clip.frameAt(1.37, 30), "forward again, between frames");
+  XCTAssertEqual([self decode:extractor at:0]["a"].index, 0, "to the start");
+  // And it goes on from there, frame by frame.
+  for (int i = 1; i < 15; i++) {
+    XCTAssertEqual([self decode:extractor at:i / 30.0]["a"].index, i);
+  }
+}
+
+- (void)testEveryFrameBackwardsAtDoubleSpeed {
+  Clip clip{"a", 0, 0, 3, 2};
+  auto extractor =
+      [self start:makeComposition([self video:VideoSpec()], {clip}, false)];
+  for (int i = 89; i >= 0; i--) {
+    double t = i / 30.0;
+    XCTAssertEqual([self decode:extractor at:t]["a"].index,
+                   clip.frameAt(t, 30), @"at %.4fs", t);
+  }
+}
+
+- (void)testABackwardRequestIntoAnEarlierItemOfAMontage {
+  for (bool lazy : {false, true}) {
+    auto extractor =
+        [self start:makeComposition([self video:VideoSpec()], kMontage, lazy)];
+    XCTAssertEqual([self decode:extractor at:4.5]["c"].index,
+                   kMontage[2].frameAt(4.5, 30));
+    auto frames = [self decode:extractor at:2.5];
+    XCTAssertEqual(frames["b"].index, kMontage[1].frameAt(2.5, 30),
+                   @"lazy: %d", lazy);
+    frames = [self decode:extractor at:0.5];
+    XCTAssertEqual(frames["a"].index, kMontage[0].frameAt(0.5, 30),
+                   @"lazy: %d", lazy);
+    if (!lazy) {
+      // Before its start, an item holds its first frame again.
+      XCTAssertEqual(frames["c"].index, kMontage[2].frameAt(0.5, 30));
+    }
+  }
 }
 
 - (void)testMaxLongSideSizesTheFrame {

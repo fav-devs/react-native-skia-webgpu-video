@@ -52,6 +52,7 @@ describe("public API", () => {
     expect(api).not.toHaveProperty("useVideoCompositionPlayer");
     expect(typeof api.exportVideoComposition).toBe("function");
     expect(typeof api.isEncodingSupported).toBe("function");
+    expect(typeof api.getVideoCompositionFeatures).toBe("function");
   });
 
   it("only offers the codec capability helpers on Android", () => {

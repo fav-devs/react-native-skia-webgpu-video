@@ -108,10 +108,13 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
     mime = playableMime(format, mime);
     codec = MediaCodec.createDecoderByType(mime);
     extractor.selectTrack(trackIndex);
-    // Capped at the item's end, as on iOS.
-    long offsetUs = Math.min(
-      Math.max(initialPositionUs - TimeHelpers.secToUs(item.getCompositionStartTime()), 0),
-      TimeHelpers.secToUs(item.getDuration()));
+    // Capped at the item's end, as on iOS, then read at the item's rate.
+    long offsetUs = ItemTime.sourceSpanUs(
+      ItemTime.heldOffsetUs(
+        TimeHelpers.secToUs(item.getCompositionStartTime()),
+        TimeHelpers.secToUs(item.getDuration()),
+        initialPositionUs),
+      item.getPlaybackRate());
     if (item.getStartTime() != 0 || offsetUs != 0) {
       extractor.seekTo(
         TimeHelpers.secToUs(item.getStartTime()) + offsetUs,
@@ -283,8 +286,7 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
       return;
     }
     boolean outputEOS = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
-    boolean sampleOutOfBounds =
-      info.presentationTimeUs > TimeHelpers.secToUs(item.getStartTime() + item.getDuration());
+    boolean sampleOutOfBounds = info.presentationTimeUs > item.sourceEndUs();
     boolean sampleBeforeStartTime =
       info.presentationTimeUs < TimeHelpers.secToUs(item.getStartTime());
 
@@ -335,12 +337,11 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
     if (pendingFrames.isEmpty()) {
       return null;
     }
-    long compositionStartTimeUs = TimeHelpers.secToUs(item.getCompositionStartTime());
-    long startTimeUs = TimeHelpers.secToUs(item.getStartTime());
+    long sourceTimeUs = item.sourceTimeUs(compositionTimeUs);
 
     List<Frame> framesToRenders = new ArrayList<>();
     for (Frame frame : pendingFrames) {
-      if (frame.presentationTimeUs - startTimeUs <= compositionTimeUs - compositionStartTimeUs || !hasRenderedFrame) {
+      if (frame.presentationTimeUs <= sourceTimeUs || !hasRenderedFrame) {
         framesToRenders.add(frame);
         hasRenderedFrame = true;
       }
@@ -387,7 +388,8 @@ public class VideoCompositionItemDecoder extends MediaCodec.Callback {
       });
     }
     long itemTime = time - TimeHelpers.secToUs(item.getCompositionStartTime());
-    long seekTime = TimeHelpers.secToUs(item.getStartTime()) + Math.max(itemTime, 0);
+    long seekTime = TimeHelpers.secToUs(item.getStartTime())
+      + ItemTime.sourceSpanUs(Math.max(itemTime, 0), item.getPlaybackRate());
     extractor.seekTo(seekTime, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
     itemEndReached = false;
     hasRenderedFrame = false;

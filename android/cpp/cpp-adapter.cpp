@@ -55,6 +55,11 @@ void install(jsi::Runtime& jsiRuntime) {
         info.setProperty(runtime, "skiaImportTransport", jsi::String::createFromAscii(runtime,
             hardware ? "native-buffer-webgpu-blit-snapshot" : "cpu-rgba-scoped-copy-webgpu-upload-snapshot"));
         info.setProperty(runtime, "zeroCopyDecode", false);
+        // What this native code implements, for JS shipped ahead of a rebuilt
+        // app: an older binary has neither and would play every item at 1×.
+        // See getVideoCompositionFeatures.
+        info.setProperty(runtime, "playbackRate", true);
+        info.setProperty(runtime, "syncBackwardSeek", true);
         return info;
       }));
   auto createVideoPlayer = jsi::Function::createFromHostFunction(

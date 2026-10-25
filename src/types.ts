@@ -219,7 +219,7 @@ type VideoCompositionItemBase = {
    */
   startTime: number;
   /**
-   * The duration in seconds of the item.
+   * The duration in seconds of the item within the composition.
    */
   duration: number;
 };
@@ -263,6 +263,20 @@ export type VideoCompositionVideoItem = VideoCompositionItemBase & {
    * Defaults to false (video items are silent).
    */
   audio?: boolean | { volume?: number };
+  /**
+   * Seconds of the file played per second of the composition, a finite
+   * number above 0: 2 plays the clip twice as fast, 0.5 at half speed.
+   * `duration` stays the item's length in the composition, so the item reads
+   * `[startTime, startTime + duration * playbackRate]` of its file.
+   *
+   * Every frame of that range is decoded: at 2× the decoder does twice the
+   * work of 1×. Only for silent items; an item with `audio` and a rate other
+   * than 1 is refused. Native code built before this option ignores it, see
+   * {@link getVideoCompositionFeatures}.
+   *
+   * @default 1
+   */
+  playbackRate?: number;
 };
 
 /**
@@ -395,6 +409,12 @@ export type VideoCompositionFramesExtractorSync = {
    * Decodes the frames until reaching the specified time.
    * This method will block the current thread until the frames are decoded.
    *
+   * A time earlier than the previous call's is served too: the items whose
+   * position went back decode again from the key frame before it, which
+   * costs a new reader on iOS and a codec flush on Android. Native code built
+   * before this ignores it and returns the previous frames, see
+   * {@link getVideoCompositionFeatures}.
+   *
    * The returned frames are only valid until the next call: draw them and
    * flush the GPU synchronously (`surface.flush(true)`) before decoding
    * further frames.
@@ -526,6 +546,31 @@ export type ExportOptions = {
   audioChannelCount?: number;
 };
 
+/**
+ * What the native code says about itself, see `getVideoResourceStats().backend`.
+ */
+export type VideoBackendInfo = Record<string, string | number | boolean> & {
+  /** Set when the native code reads `playbackRate`, see {@link VideoCompositionFeatures}. */
+  playbackRate?: boolean;
+  /** Set when the sync extractor serves earlier times, see {@link VideoCompositionFeatures}. */
+  syncBackwardSeek?: boolean;
+};
+
+/**
+ * Features of the installed native code that JS shipped on its own (through
+ * Metro, an update) cannot assume: an app binary built before them ignores
+ * them silently.
+ */
+export type VideoCompositionFeatures = {
+  /** Video items honour {@link VideoCompositionVideoItem.playbackRate}. */
+  playbackRate: boolean;
+  /**
+   * {@link VideoCompositionFramesExtractorSync.decodeCompositionFrames}
+   * returns the frames at a time earlier than the previous call's.
+   */
+  syncBackwardSeek: boolean;
+};
+
 export type RNSkiaVideoModule = {
   frameProtocolVersion?: number;
   /** Internal Android capability negotiation, before creating a decoder. */
@@ -540,7 +585,7 @@ export type RNSkiaVideoModule = {
     maxBytes: number;
   };
   getResourceStats?: () => Record<string, number>;
-  getBackendInfo?: () => Record<string, string | number | boolean>;
+  getBackendInfo?: () => VideoBackendInfo;
 
   /**
    * Creates a video player for the specified video file.

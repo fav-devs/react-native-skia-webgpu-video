@@ -191,6 +191,26 @@ Composition clips are **silent by default**. Set `audio: true` to include the so
 
 Audio implementations are retained on iOS and Android, including AAC export. The latest device performance campaign did **not** validate audible output or audio/video synchronization. See the [typed API](src/types.ts) for the complete options.
 
+### Speed
+
+`playbackRate` plays a video item faster or slower: `duration` stays its length in the composition, and it reads `duration * playbackRate` seconds of its file from `startTime`. A 2 s item at `playbackRate: 2` shows 4 s of the file, in the preview and the export:
+
+```ts
+{ id: 'clip', path, compositionStartTime: 0, startTime: 10, duration: 2, playbackRate: 2 }
+```
+
+Every frame of that range is decoded, so a 2× item costs twice the decoding of a 1× one. Items with `audio` must stay at 1×: the audio track is not time-stretched.
+
+JS that reaches an app before its native build (Metro, an over-the-air update) can ask what the native code supports: an older binary would play the item at 1×. `useVideoComposition` and `exportVideoComposition` refuse a rate other than 1 on such a binary.
+
+```ts
+import { getVideoCompositionFeatures } from 'react-native-skia-webgpu-video';
+
+const { playbackRate, syncBackwardSeek } = getVideoCompositionFeatures();
+```
+
+`syncBackwardSeek` says whether a sync extractor's `decodeCompositionFrames(time)` serves a time earlier than its previous call; older binaries return the previous frames.
+
 ## Migrating from Skia Video
 
 Use `useVideoComposition` for timelines and `useVideoPlayback` for single videos. Rename the previous hook imports and calls; the old names are no longer exported. Composition structure, timeline units, drawing callbacks, and player/export controls are retained. Texture interop changes: replace `MakeImageFromNativeTextureUnstable(frame.texture)` with `drawVideoFrame` or `makeVideoFrameImage`.

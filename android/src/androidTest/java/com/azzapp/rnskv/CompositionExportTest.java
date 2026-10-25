@@ -93,6 +93,72 @@ public class CompositionExportTest {
     assertFalse(frames.containsKey("gone"));
   }
 
+  // playbackRate: 6 s of composition read 3 s of file at 0.5×, 3 s read the
+  // whole 6 s file at 2×. The export asks at the composition's frame rate.
+  @Test
+  public void aHalfSpeedItemGivesItsFrameAtEveryTime() throws Exception {
+    Clip[] clips = {new Clip("a", 0, 0, 6, 0.5)};
+    walk(composition(video, false, clips), clips, false);
+  }
+
+  @Test
+  public void aDoubleSpeedItemGivesItsFrameAtEveryTime() throws Exception {
+    Clip[] clips = {new Clip("a", 0, 0, 3, 2)};
+    walk(composition(video, false, clips), clips, false);
+  }
+
+  @Test
+  public void aRetimedLazyMontageGivesEachItemItsFrame() throws Exception {
+    Clip[] clips = {
+      new Clip("a", 0, 0, 2, 2),
+      new Clip("b", 2, 1, 2, 0.5),
+      new Clip("c", 4, 2, 2, 2),
+    };
+    walk(composition(video, true, clips), clips, true);
+  }
+
+  // An app reading frames for a reverse clip or a backward scrub asks for
+  // earlier times: each is the frame at its own time, not the last decoded.
+  @Test
+  public void aBackwardRequestGivesTheEarlierFrame() throws Exception {
+    Clip clip = new Clip("a", 0, 0, 6);
+    VideoCompositionFramesExtractorSync extractor = start(composition(video, false, clip));
+    assertFrameAt(decode(extractor, 3.0), clip, 3.0, SLACK_US);
+    assertFrameAt(decode(extractor, 1.0), clip, 1.0, SLACK_US);
+    assertFrameAt(decode(extractor, 1.37), clip, 1.37, SLACK_US);
+    assertFrameAt(decode(extractor, 0), clip, 0, SLACK_US);
+    // And it goes on from there, frame by frame.
+    for (int i = 1; i < 15; i++) {
+      double time = i / (double) TestVideo.FPS;
+      assertFrameAt(decode(extractor, time), clip, time, SLACK_US);
+    }
+  }
+
+  @Test
+  public void everyFrameBackwardsAtDoubleSpeed() throws Exception {
+    Clip clip = new Clip("a", 0, 0, 3, 2);
+    VideoCompositionFramesExtractorSync extractor = start(composition(video, false, clip));
+    for (int i = 3 * TestVideo.FPS - 1; i >= 0; i--) {
+      double time = i / (double) TestVideo.FPS;
+      assertFrameAt(decode(extractor, time), clip, time, SLACK_US);
+    }
+  }
+
+  @Test
+  public void aBackwardRequestIntoAnEarlierItemOfAMontage() throws Exception {
+    for (boolean lazy : new boolean[]{false, true}) {
+      VideoCompositionFramesExtractorSync extractor = start(composition(video, lazy, MONTAGE));
+      assertFrameAt(decode(extractor, 4.5), MONTAGE[2], 4.5, SLACK_US);
+      assertFrameAt(decode(extractor, 2.5), MONTAGE[1], 2.5, SLACK_US);
+      Map<String, VideoFrame> frames = decode(extractor, 0.5);
+      assertFrameAt(frames, MONTAGE[0], 0.5, SLACK_US);
+      if (!lazy) {
+        // Before its start, an item holds its first frame again.
+        assertFrameAt(frames, MONTAGE[2], MONTAGE[2].compositionStart, SLACK_US);
+      }
+    }
+  }
+
   @Test
   public void maxLongSideSizesTheFrame() throws Exception {
     Clip clip = new Clip("a", 0, 0, 2);

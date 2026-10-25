@@ -8,6 +8,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <jsi/jsi.h>
 #import <map>
+#import <set>
 
 namespace RNSkiaVideo {
 using namespace facebook;
@@ -30,8 +31,11 @@ private:
   std::map<std::string, std::shared_ptr<VideoCompositionItemDecoder>>
       itemDecoders;
   std::map<std::string, std::shared_ptr<VideoFrame>> currentFrames;
+  /** The time each open decoder was last asked for. */
+  std::map<std::string, double> requestedTimes;
   void release();
   void updateWindow(CMTime time);
+  std::set<std::string> seekBack(CMTime time);
 };
 
 } // namespace RNSkiaVideo

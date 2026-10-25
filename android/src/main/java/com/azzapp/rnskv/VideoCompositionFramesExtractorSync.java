@@ -26,6 +26,9 @@ public class VideoCompositionFramesExtractorSync {
 
   private final Set<VideoComposition.Item> itemsEnded = new HashSet<>();
 
+  /** The composition time each open item was last asked for. */
+  private final Map<VideoComposition.Item, Long> requestedTimes = new HashMap<>();
+
   private final Map<String, Long> renderedTimes = new HashMap<>();
 
   private HandlerThread exportThread = null;
@@ -93,6 +96,7 @@ public class VideoCompositionFramesExtractorSync {
           decodingTimeUs = targetUs;
           decoder.updateWindow(decodingTimeUs);
           forgetClosedItems();
+          seekItemsBack(decodingTimeUs);
           decoding = true;
           renderedTimes.clear();
           checkIfFrameDecoded();
@@ -137,6 +141,31 @@ public class VideoCompositionFramesExtractorSync {
       if (item.isVideo() && !decoder.isOpen(item)) {
         itemsTimes.remove(item);
         itemsEnded.remove(item);
+        requestedTimes.remove(item);
+      }
+    }
+  }
+
+  /**
+   * A request earlier than an item's last one: its codec has released the
+   * frames up to the last one, so it starts again from the key frame before
+   * the new time, as a preview seek does. What it had decoded and whether it
+   * had ended no longer hold. Items whose position held to their range has not
+   * moved keep their codec: one past its end or not started yet shows the
+   * same frame either way.
+   */
+  private void seekItemsBack(long targetUs) {
+    for (VideoComposition.Item item : composition.getItems()) {
+      if (!item.isVideo() || !decoder.isOpen(item)) {
+        continue;
+      }
+      Long lastUs = requestedTimes.put(item, targetUs);
+      if (lastUs != null && ItemTime.movesBack(
+        TimeHelpers.secToUs(item.getCompositionStartTime()),
+        TimeHelpers.secToUs(item.getDuration()), lastUs, targetUs)) {
+        decoder.seekItem(item, targetUs);
+        itemsTimes.remove(item);
+        itemsEnded.remove(item);
       }
     }
   }
@@ -179,9 +208,7 @@ public class VideoCompositionFramesExtractorSync {
         continue;
       }
       long itemCurrentTimeUs = itemTime;
-      long startTimeUs = TimeHelpers.secToUs(item.getStartTime());
-      long compositionStartTimeUs = TimeHelpers.secToUs(item.getCompositionStartTime());
-      if (itemCurrentTimeUs - startTimeUs < decodingTimeUs - compositionStartTimeUs) {
+      if (itemCurrentTimeUs < item.sourceTimeUs(decodingTimeUs)) {
         allItemsReady = false;
       }
     }

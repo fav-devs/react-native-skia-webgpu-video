@@ -22,6 +22,7 @@ import type {
   VideoFrame,
 } from "./types";
 import RNSkiaVideoModule from "./RNSkiaVideoModule";
+import { checkVideoCompositionFeatures } from "./compositionFeatures";
 import {
   clearVideoFrameImages,
   ownVideoFrames,
@@ -296,6 +297,7 @@ const executeExport = <T>(args: VideoExportArguments<T>): Promise<void> =>
       );
       if (!Number.isSafeInteger(nbFrames) || nbFrames <= 0)
         throw new Error("Invalid export frame count");
+      checkVideoCompositionFeatures(videoComposition);
     } catch (error) {
       reject(error);
       return;

@@ -89,11 +89,12 @@ void VideoCompositionItemDecoder::setupReader(CMTime initialTime) {
 
   auto startTime = CMTimeMakeWithSeconds(item->startTime, NSEC_PER_SEC);
   // Capped at the item's end: a seek past it would otherwise ask the reader
-  // for a negative duration.
-  auto position = CMTimeMakeWithSeconds(
-      MIN(MAX((CMTimeGetSeconds(initialTime) - item->compositionStartTime), 0),
-          item->duration),
-      NSEC_PER_SEC);
+  // for a negative duration. Held in composition time, then read in the
+  // file's: the item reads duration * playbackRate seconds of it.
+  auto position = sourceSpan(CMTimeMakeWithSeconds(
+      ItemTime::heldOffset(item->compositionStartTime, item->duration,
+                           CMTimeGetSeconds(initialTime)),
+      NSEC_PER_SEC));
   // The start in the track's own timescale, rounded down. Given in
   // nanoseconds, a start on a frame's exact time (1.2 s, frame 36 at 30 fps)
   // can land a hair before that frame once AVAssetReader applies the track's
@@ -101,7 +102,7 @@ void VideoCompositionItemDecoder::setupReader(CMTime initialTime) {
   // file with reordered frames): the reader then hands over the previous
   // frame stamped with the requested time and never the one asked for.
   CMTime endTime = CMTimeAdd(
-      startTime, CMTimeMakeWithSeconds(item->duration, NSEC_PER_SEC));
+      startTime, sourceSpan(CMTimeMakeWithSeconds(item->duration, NSEC_PER_SEC)));
   CMTime readStart = CMTimeAdd(startTime, position);
   if (videoTrack.naturalTimeScale > 0) {
     readStart = CMTimeMinimum(
@@ -192,7 +193,18 @@ void VideoCompositionItemDecoder::setupReader(CMTime initialTime) {
   }
 }
 
+// In composition seconds: the preview reads playbackRate times as much of the
+// file ahead of the displayed frame.
 #define DECODER_INPUT_TIME_ADVANCE 0.1
+
+// A 1× item keeps its CMTime as it is, so it maps exactly as it did before
+// playbackRate; another rate goes through seconds, to the nanosecond.
+CMTime VideoCompositionItemDecoder::sourceSpan(CMTime compositionSpan) const {
+  if (item->playbackRate == 1) return compositionSpan;
+  return CMTimeMakeWithSeconds(
+      ItemTime::sourceSpan(CMTimeGetSeconds(compositionSpan), item->playbackRate),
+      NSEC_PER_SEC);
+}
 
 
 using FrameQueue = std::list<std::pair<double, CMSampleBufferRef>>;
@@ -274,14 +286,17 @@ void VideoCompositionItemDecoder::advanceDecoder(CMTime currentTime) {
     CMTime startTime = CMTimeMakeWithSeconds(item->startTime, NSEC_PER_SEC);
     CMTime compositionStartTime =
         CMTimeMakeWithSeconds(item->compositionStartTime, NSEC_PER_SEC);
-    position =
-        CMTimeAdd(startTime, CMTimeSubtract(currentTime, compositionStartTime));
+    // From here on every time is the file's: the position, the read-ahead,
+    // the item's end and the wrap below.
+    position = CMTimeAdd(
+        startTime, sourceSpan(CMTimeSubtract(currentTime, compositionStartTime)));
     inputPosition =
         realTime
-            ? CMTimeAdd(position, CMTimeMakeWithSeconds(
-                                      DECODER_INPUT_TIME_ADVANCE, NSEC_PER_SEC))
+            ? CMTimeAdd(position, sourceSpan(CMTimeMakeWithSeconds(
+                                      DECODER_INPUT_TIME_ADVANCE, NSEC_PER_SEC)))
             : position;
-    CMTime duration = CMTimeMakeWithSeconds(item->duration, NSEC_PER_SEC);
+    CMTime duration =
+        sourceSpan(CMTimeMakeWithSeconds(item->duration, NSEC_PER_SEC));
     endTime = CMTimeAdd(startTime, duration);
 
     if (realTime && CMTimeCompare(endTime, inputPosition) < 0 && !hasLooped) {
@@ -367,12 +382,13 @@ VideoCompositionItemDecoder::acquireFrameForTime(CMTime currentTime,
     // Plus a microsecond: a time asked for at exactly a frame's timestamp
     // (the export asks for i / fps) lands a fraction of a nanosecond before
     // it once rounded to nanoseconds, and was given the previous frame — an
-    // export at the file's frame rate duplicated and skipped frames.
+    // export at the file's frame rate duplicated and skipped frames. Added in
+    // the file's time, after the rate.
     double offset =
         MAX(CMTimeGetSeconds(currentTime) - item->compositionStartTime, 0);
     CMTime start = CMTimeMakeWithSeconds(item->startTime, NSEC_PER_SEC);
     CMTime position = CMTimeAdd(
-        CMTimeAdd(start, CMTimeMakeWithSeconds(offset, NSEC_PER_SEC)),
+        CMTimeAdd(start, sourceSpan(CMTimeMakeWithSeconds(offset, NSEC_PER_SEC))),
         CMTimeMake(1, 1000000));
 
     auto it = decodedFrames.begin();
@@ -433,11 +449,15 @@ void VideoCompositionItemDecoder::seekTo(CMTime currentTime) {
     // forward steps, and rebuilding an AVAssetReader for each one is what
     // makes dragging the playhead stutter. Reading on costs the frames in
     // between, which is cheaper than a new reader for anything this short.
+    // Measured in the file's time: at 2× a second of composition is two of
+    // decoding.
     if (!hasLooped && seekReadsOn(assetReader &&
                         assetReader.status == AVAssetReaderStatusReading,
                     CMTIME_IS_VALID(lastRequestedTime),
-                    CMTimeGetSeconds(lastRequestedTime),
-                    CMTimeGetSeconds(currentTime))) {
+                    ItemTime::sourceSpan(CMTimeGetSeconds(lastRequestedTime),
+                                         item->playbackRate),
+                    ItemTime::sourceSpan(CMTimeGetSeconds(currentTime),
+                                         item->playbackRate))) {
       // The reader is already ahead of the displayed frame. Keep its queued
       // samples: throwing them away loses a nearby seek's target permanently.
       // Keep its generation too, so an in-flight batch from this same reader

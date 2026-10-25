@@ -22,7 +22,11 @@ import {
   exportVideoComposition,
   type VideoFrameProcessingContext,
 } from "../exportVideoComposition";
-import type { VideoComposition, VideoFrame } from "../types";
+import type {
+  VideoComposition,
+  VideoCompositionVideoItem,
+  VideoFrame,
+} from "../types";
 import { createSerializedUiRuntime } from "../../test/utils/serializedUiRuntime";
 
 // Separate worklet turns expose cancellation and overlapping export races.
@@ -151,6 +155,14 @@ const composition: VideoComposition = {
       duration: 1,
     },
   ],
+};
+const retimedClip: VideoCompositionVideoItem = {
+  id: "clip",
+  path: "/videos/clip.mp4",
+  compositionStartTime: 0,
+  startTime: 0,
+  duration: 1,
+  playbackRate: 2,
 };
 const baseOptions = {
   videoComposition: composition,
@@ -415,6 +427,38 @@ describe("exportVideoComposition", () => {
         framesCompleted: 4,
         nbFrames: 4,
       });
+    }
+  });
+  it("refuses a playbackRate the native code would ignore, before allocating", async () => {
+    await expect(
+      runExport({
+        videoComposition: {
+          ...composition,
+          items: [retimedClip],
+        },
+      }),
+    ).rejects.toThrow("playbackRate needs a native build");
+    expect(createVideoEncoder).not.toHaveBeenCalled();
+    expect(makeOffscreen).not.toHaveBeenCalled();
+  });
+  it("hands playbackRate to the native extractor that supports it", async () => {
+    const module = RNSkiaVideoModule as typeof RNSkiaVideoModule & {
+      getBackendInfo?: jest.Mock;
+    };
+    module.getBackendInfo = jest.fn(() => ({
+      playbackRate: true,
+      syncBackwardSeek: true,
+    }));
+    try {
+      const videoComposition: VideoComposition = {
+        ...composition,
+        items: [retimedClip],
+      };
+      const { encoder } = await runExport({ videoComposition });
+      expect(createExtractor).toHaveBeenCalledWith(videoComposition);
+      expect(encoder.encodeFrame).toHaveBeenCalledTimes(4);
+    } finally {
+      delete module.getBackendInfo;
     }
   });
   it("rejects an already aborted signal without allocating native resources", async () => {

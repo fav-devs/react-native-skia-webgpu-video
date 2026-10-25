@@ -22,6 +22,10 @@ int main() {
   rejects([] { checkedSizeProduct(checkedPixelStorage(INT32_MAX, INT32_MAX,
       static_cast<size_t>(INT32_MAX) * 4), 3, "pool capacity"); });
   rejects([] { checkedMediaSeconds(std::numeric_limits<double>::quiet_NaN()); });
+  for (double invalid : {0.0, -0.5, std::numeric_limits<double>::infinity(),
+                         std::numeric_limits<double>::quiet_NaN()})
+    rejects([&] { checkedPlaybackRate(invalid); });
+  assert(checkedPlaybackRate(0.5) == 0.5 && checkedPlaybackRate(2) == 2);
   assert(checkedStorageInteger(0, "offset") == 0);
   assert(checkedPositiveInt(2147483647.0, "dimension") == INT32_MAX);
   std::mt19937 random(0x524e5356);

@@ -79,15 +79,18 @@ jsi::Value VideoCompositionFramesExtractorSyncHostObject::get(
             if (disposed) throw std::runtime_error("Extractor is disposed");
             auto frames = jsi::Object(runtime);
             updateWindow(currentTime);
+            auto seeked = seekBack(currentTime);
             for (const auto& entry : itemDecoders) {
               auto itemId = entry.first;
               auto decoder = entry.second;
 
               decoder->advanceDecoder(currentTime);
 
+              // After a seek the previous frame is from later on: take the
+              // first one decoded, as for an item's first request.
               auto previousFrame = currentFrames[itemId];
-              auto frame =
-                  decoder->acquireFrameForTime(currentTime, !previousFrame);
+              auto frame = decoder->acquireFrameForTime(
+                  currentTime, !previousFrame || seeked.count(itemId));
               if (frame) {
                 currentFrames[itemId] = frame;
               } else {
@@ -129,7 +132,34 @@ void VideoCompositionFramesExtractorSyncHostObject::release() {
   }
   itemDecoders.clear();
   currentFrames.clear();
+  requestedTimes.clear();
   }
+}
+
+// A request earlier than an item's last one: its reader has gone past the
+// frame to show, and an AVAssetReader only moves forward. Its decoder starts
+// a new reader at the key frame before the time, as a preview seek does.
+// Items whose position held to their range has not moved keep their reader:
+// one past its end or not started yet shows the same frame either way.
+std::set<std::string>
+VideoCompositionFramesExtractorSyncHostObject::seekBack(CMTime time) {
+  std::set<std::string> seeked;
+  double target = CMTimeGetSeconds(time);
+  for (const auto& item : composition->items) {
+    auto decoder = itemDecoders.find(item->id);
+    if (decoder == itemDecoders.end()) {
+      continue;
+    }
+    auto last = requestedTimes.find(item->id);
+    if (last != requestedTimes.end() &&
+        ItemTime::movesBack(item->compositionStartTime, item->duration,
+                            last->second, target)) {
+      decoder->second->seekTo(time);
+      seeked.insert(item->id);
+    }
+    requestedTimes[item->id] = target;
+  }
+  return seeked;
 }
 
 // Opens the decoders of the items coming up and closes those left behind.
@@ -161,6 +191,7 @@ void VideoCompositionFramesExtractorSyncHostObject::updateWindow(CMTime time) {
       it->second->release();
       itemDecoders.erase(it);
       currentFrames.erase(item->id);
+      requestedTimes.erase(item->id);
     }
   }
 }

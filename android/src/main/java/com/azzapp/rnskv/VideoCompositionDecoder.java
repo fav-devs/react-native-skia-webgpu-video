@@ -442,6 +442,21 @@ public class VideoCompositionDecoder {
   }
 
   /**
+   * Seeks one item's decoder, leaving the others where they are: the export
+   * asks for an earlier time only of the items it has gone past.
+   *
+   * @param item     the item
+   * @param position the position to seek to, in composition microseconds
+   */
+  synchronized public void seekItem(VideoComposition.Item item, long position) {
+    Slot slot = slots.get(item);
+    VideoCompositionItemDecoder decoder = slot != null ? slot.decoder : null;
+    if (decoder != null) {
+      decoder.seekTo(position);
+    }
+  }
+
+  /**
    * Releases the resources.
    */
   public void release() {

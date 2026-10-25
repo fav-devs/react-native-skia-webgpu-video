@@ -35,6 +35,7 @@ try {
   run(process.execPath, ['scripts/test-skia-provider-ownership.mjs', ...(asan ? ['--asan'] : [])]);
   test('seek-policy', ['test/native/SeekPolicyTest.cpp']);
   test('decoder-window', ['test/native/DecoderWindowTest.cpp']);
+  test('item-time', ['test/native/ItemTimeTest.cpp']);
   test('memory-budget', ['test/native/MemoryBudgetTest.cpp']);
   test('rgba-frame-lease', ['android/tests/RgbaFrameLeaseTest.cpp']);
   test('checked-sizes', ['test/native/CheckedSizesTest.cpp']);

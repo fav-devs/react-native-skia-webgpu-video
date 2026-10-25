@@ -54,6 +54,8 @@ public class CompositionPreviewTest {
 
   private VideoComposition composition;
 
+  private Clip[] clips;
+
   private VideoCompositionDecoder decoder;
 
   private HandlerThread playback;
@@ -111,6 +113,37 @@ public class CompositionPreviewTest {
     // At most the item before, kept past its end, the one on screen, and the
     // one after, opened ahead.
     playThrough(3, false);
+  }
+
+  // playbackRate: the codec releases frames rate times as fast, from the same
+  // composition clock.
+  @Test
+  public void aHalfSpeedMontagePlaysThrough() throws Exception {
+    open(true,
+      new Clip("a", 0, 0, 2, 0.5),
+      new Clip("b", 2, 1, 2, 0.5),
+      new Clip("c", 4, 2, 2, 0.5));
+    playThrough(3, false);
+  }
+
+  @Test
+  public void aDoubleSpeedMontagePlaysThrough() throws Exception {
+    open(true,
+      new Clip("a", 0, 0, 2, 2),
+      new Clip("b", 2, 1, 2, 2),
+      new Clip("c", 4, 2, 2, 2));
+    playThrough(3, false);
+  }
+
+  @Test
+  public void aSeekAtDoubleSpeedShowsItsFrame() throws Exception {
+    Clip clip = new Clip("a", 0, 0, 3, 2);
+    open(false, clip);
+    awaitFrame(clip, 0);
+    seek(2.25);
+    awaitFrame(clip, 2.25);
+    seek(0.5);
+    awaitFrame(clip, 0.5);
   }
 
   @Test
@@ -206,7 +239,12 @@ public class CompositionPreviewTest {
   }
 
   private void open(boolean lazy) throws Exception {
-    composition = composition(video, lazy, MONTAGE);
+    open(lazy, MONTAGE);
+  }
+
+  private void open(boolean lazy, Clip... clips) throws Exception {
+    this.clips = clips;
+    composition = composition(video, lazy, clips);
     decoder = new VideoCompositionDecoder(composition, true);
     decoder.setOnErrorListener(errors::add);
     decoder.setOnOpenErrorListener(errors::add);
@@ -226,7 +264,7 @@ public class CompositionPreviewTest {
     while (positionUs < endUs) {
       Map<String, VideoFrame> frames = pump();
       double time = positionUs / 1e6;
-      Clip clip = clipAt(MONTAGE, time);
+      Clip clip = clipAt(clips, time);
       // Clear of the cut, where "on screen" depends on which thread looked.
       if (clip != null && time - clip.compositionStart > 0.3 && clip.end() - time > 0.1) {
         assertFrameAt(frames, clip, time, PLAYING_SLACK_US);
@@ -238,7 +276,7 @@ public class CompositionPreviewTest {
     assertTrue("only " + checks + " frames checked", checks > 50);
     assertTrue("up to " + maxOpen + " decoders open", maxOpen <= maxOpenAllowed);
     if (allOpen) {
-      assertEquals(MONTAGE.length, maxOpen);
+      assertEquals(clips.length, maxOpen);
     }
   }
 

@@ -24,12 +24,19 @@ final class Compositions {
     final double compositionStart;
     final double start;
     final double duration;
+    /** The item's playbackRate: file seconds per composition second. */
+    final double rate;
 
     Clip(String id, double compositionStart, double start, double duration) {
+      this(id, compositionStart, start, duration, 1);
+    }
+
+    Clip(String id, double compositionStart, double start, double duration, double rate) {
       this.id = id;
       this.compositionStart = compositionStart;
       this.start = start;
       this.duration = duration;
+      this.rate = rate;
     }
 
     double end() {
@@ -42,7 +49,7 @@ final class Compositions {
 
     /** The file time shown at this composition time. */
     long sourceUs(double time) {
-      return TimeHelpers.secToUs(start + time - compositionStart);
+      return TimeHelpers.secToUs(start + (time - compositionStart) * rate);
     }
   }
 
@@ -57,8 +64,12 @@ final class Compositions {
     List<VideoComposition.Item> items = new ArrayList<>();
     double duration = 0;
     for (Clip clip : clips) {
-      items.add(new VideoComposition.Item(
-        clip.id, video.getPath(), clip.compositionStart, clip.start, clip.duration));
+      VideoComposition.Item item = new VideoComposition.Item(
+        clip.id, video.getPath(), clip.compositionStart, clip.start, clip.duration);
+      if (clip.rate != 1) {
+        set(item, "playbackRate", clip.rate);
+      }
+      items.add(item);
       duration = Math.max(duration, clip.end());
     }
     VideoComposition composition = new VideoComposition(duration, items);

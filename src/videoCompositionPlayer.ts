@@ -16,6 +16,7 @@ import type {
   VideoCompositionFramesExtractor,
 } from "./types";
 import RNSkiaVideoModule from "./RNSkiaVideoModule";
+import { checkVideoCompositionFeatures } from "./compositionFeatures";
 import useEventListener from "./utils/useEventListener";
 import { PixelRatio } from "react-native";
 import { scheduleOnRN } from "react-native-worklets";
@@ -187,6 +188,7 @@ export const useVideoComposition = <T = undefined>({
     }
     let created: VideoCompositionFramesExtractor;
     try {
+      checkVideoCompositionFeatures(composition);
       created =
         RNSkiaVideoModule.createVideoCompositionFramesExtractor(composition);
     } catch (error) {

@@ -36,7 +36,7 @@ function run(command, args, capture = false) {
 }
 try {
   const path = 'java/com/azzapp/rnskv';
-  const classes = ['FrameSize', 'DecoderWindow', 'RgbaLayout', 'DecodeRequests'];
+  const classes = ['FrameSize', 'DecoderWindow', 'RgbaLayout', 'DecodeRequests', 'ItemTime'];
   const sources = classes.flatMap(name => [`android/src/main/${path}/${name}.java`, `android/src/test/${path}/${name}Test.java`]);
   run('javac', ['-cp', `${junit}:${hamcrest}`, '-d', output, ...sources]);
   const testOutput = run('java', ['-cp', `${output}:${junit}:${hamcrest}`, 'org.junit.runner.JUnitCore', ...classes.map(name => `com.azzapp.rnskv.${name}Test`)], true);
