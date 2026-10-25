@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -59,5 +60,20 @@ inline double checkedPlaybackRate(double rate) {
     throw std::invalid_argument("Invalid playbackRate: expected a finite number above 0");
   }
   return rate;
+}
+
+// The composition player's playbackRate is held to [-4, 4]: past that the
+// decoders mostly skip frames, and backward windows (ios/Shuttle.h) shrink
+// to a frame or two.
+constexpr double kMaxShuttleRate = 4;
+
+// The composition player's signed playbackRate: negative plays backward, 0
+// holds the frame while playing. Held to the range rather than refused, as
+// a drag's velocity overshoots it.
+inline double checkedShuttleRate(double rate) {
+  if (!std::isfinite(rate)) {
+    throw std::invalid_argument("Invalid playbackRate: expected a finite number");
+  }
+  return std::min(std::max(rate, -kMaxShuttleRate), kMaxShuttleRate);
 }
 } // namespace RNSkiaVideo
