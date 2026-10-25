@@ -51,6 +51,22 @@ public class DecoderWindowTest {
     assertFalse(PREVIEW.opens(0, s(5), s(59)));
   }
 
+  @Test
+  public void playingBackwardTheLeadIsPastTheEnd() {
+    assertTrue(PREVIEW.opens(s(10), s(20), s(21.4), true, 1));
+    assertFalse(PREVIEW.opens(s(10), s(20), s(21.5), true, 1));
+    assertFalse(PREVIEW.opens(s(10), s(20), s(9), true, 1));
+    assertTrue(PREVIEW.keeps(s(10), s(20), s(9.6), true, 1));
+    assertFalse(PREVIEW.keeps(s(10), s(20), s(9.4), true, 1));
+  }
+
+  @Test
+  public void fasterThan1xTheLeadIsLonger() {
+    assertTrue(PREVIEW.opens(s(10), s(20), s(4), false, 4));
+    assertTrue(PREVIEW.opens(s(10), s(20), s(25.9), true, 4));
+    assertFalse(PREVIEW.opens(s(10), s(20), s(8.4), false, 0.25));
+  }
+
   // Otherwise an item could be opened and closed at the same position.
   @Test
   public void opensImpliesKeeps() {
@@ -59,9 +75,14 @@ public class DecoderWindowTest {
       long start = (long) (random.nextDouble() * s(55));
       long end = start + s(0.5) + (long) (random.nextDouble() * s(10));
       long position = (long) (random.nextDouble() * s(62)) - s(1);
+      boolean backward = random.nextBoolean();
+      double speed = random.nextDouble() * 4;
       for (DecoderWindow window : new DecoderWindow[]{PREVIEW, EXPORT}) {
         if (window.opens(start, end, position)) {
           assertTrue(window.keeps(start, end, position));
+        }
+        if (window.opens(start, end, position, backward, speed)) {
+          assertTrue(window.keeps(start, end, position, backward, speed));
         }
       }
     }

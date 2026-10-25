@@ -48,6 +48,26 @@ int main() {
   expect("not without looping", preview.opens(0, 5, 59, duration, false),
          false);
 
+  // Playing backward (a shuttle), the lead is past the item's end.
+  expect("backward opens within 1.5s past the end",
+         preview.opens(10, 20, 21.4, duration, false, true), true);
+  expect("backward not 1.5s past the end",
+         preview.opens(10, 20, 21.5, duration, false, true), false);
+  expect("backward does not open ahead of the start",
+         preview.opens(10, 20, 9, duration, false, true), false);
+  expect("backward keeps a little before the start",
+         preview.keeps(10, 20, 9.6, duration, false, true), true);
+  expect("backward drops past the margin before the start",
+         preview.keeps(10, 20, 9.4, duration, false, true), false);
+  expect("no loop backward", preview.opens(0, 5, 59, duration, true, true),
+         false);
+  expect("at 4x the lead is 6s", preview.opens(10, 20, 4, duration, false, false, 4),
+         true);
+  expect("backward at 4x too", preview.opens(10, 20, 25.9, duration, false, true, 4),
+         true);
+  expect("slower than 1x, the lead stays",
+         preview.opens(10, 20, 8.4, duration, false, false, 0.25), false);
+
   std::mt19937 random(1);
   std::uniform_real_distribution<double> unit(0, 1);
   bool opensImpliesKeeps = true;
@@ -56,9 +76,11 @@ int main() {
     double end = start + 0.5 + unit(random) * 10;
     double position = unit(random) * 62 - 1;
     bool looping = unit(random) < 0.5;
+    bool backward = unit(random) < 0.5;
+    double speed = unit(random) * 4;
     for (auto* window : {&preview, &exportWindow}) {
-      if (window->opens(start, end, position, duration, looping) &&
-          !window->keeps(start, end, position, duration, looping)) {
+      if (window->opens(start, end, position, duration, looping, backward, speed) &&
+          !window->keeps(start, end, position, duration, looping, backward, speed)) {
         opensImpliesKeeps = false;
       }
     }

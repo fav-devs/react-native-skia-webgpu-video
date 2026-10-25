@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 namespace RNSkiaVideo {
 
 /**
@@ -15,16 +17,30 @@ public:
 
   bool isLazy() const { return lazy; }
 
+  /**
+   * Playing `backward` (see Shuttle.h), the lead is past the item's end, the
+   * side the playhead comes from; there is no loop backward. Faster than 1×
+   * (`speed`, the rate's magnitude), the lead is as long in wall time as at
+   * 1×.
+   */
   bool opens(double start, double end, double position, double duration,
-             bool looping) const {
-    return !lazy || within(start - lead, end, position, duration, looping);
+             bool looping, bool backward = false, double speed = 1) const {
+    if (!lazy) return true;
+    double ahead = leadAt(speed);
+    if (backward) return within(start, end + ahead, position, duration, false);
+    return within(start - ahead, end, position, duration, looping);
   }
 
   /** Wider than opens, so an item is never closed and reopened at one edge. */
   bool keeps(double start, double end, double position, double duration,
-             bool looping) const {
-    return !lazy || within(start - lead - kMargin, end + kMargin, position,
-                           duration, looping);
+             bool looping, bool backward = false, double speed = 1) const {
+    if (!lazy) return true;
+    double ahead = leadAt(speed);
+    if (backward)
+      return within(start - kMargin, end + ahead + kMargin, position, duration,
+                    false);
+    return within(start - ahead - kMargin, end + kMargin, position, duration,
+                  looping);
   }
 
 private:
@@ -37,6 +53,8 @@ private:
 
   bool lazy;
   double lead;
+
+  double leadAt(double speed) const { return lead * std::max(1.0, speed); }
 
   static bool within(double from, double to, double position, double duration,
                      bool looping) {

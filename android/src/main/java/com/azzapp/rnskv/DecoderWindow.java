@@ -41,7 +41,7 @@ final class DecoderWindow {
    * @param positionUs the composition time
    */
   boolean opens(long startUs, long endUs, long positionUs) {
-    return !lazy || (positionUs >= startUs - leadUs && positionUs < endUs);
+    return opens(startUs, endUs, positionUs, false, 1);
   }
 
   /**
@@ -49,7 +49,32 @@ final class DecoderWindow {
    * either side of the same edge.
    */
   boolean keeps(long startUs, long endUs, long positionUs) {
-    return !lazy
-      || (positionUs >= startUs - leadUs - MARGIN_US && positionUs < endUs + MARGIN_US);
+    return keeps(startUs, endUs, positionUs, false, 1);
+  }
+
+  /**
+   * Playing {@code backward} (see {@link Shuttle}), the lead is past the
+   * item's end, the side the playhead comes from. Faster than 1×
+   * ({@code speed}, the rate's magnitude), the lead is as long in wall time as
+   * at 1×.
+   */
+  boolean opens(long startUs, long endUs, long positionUs, boolean backward, double speed) {
+    if (!lazy) return true;
+    long ahead = leadAt(speed);
+    if (backward) return positionUs >= startUs && positionUs < endUs + ahead;
+    return positionUs >= startUs - ahead && positionUs < endUs;
+  }
+
+  boolean keeps(long startUs, long endUs, long positionUs, boolean backward, double speed) {
+    if (!lazy) return true;
+    long ahead = leadAt(speed);
+    if (backward) {
+      return positionUs >= startUs - MARGIN_US && positionUs < endUs + ahead + MARGIN_US;
+    }
+    return positionUs >= startUs - ahead - MARGIN_US && positionUs < endUs + MARGIN_US;
+  }
+
+  private long leadAt(double speed) {
+    return speed > 1 ? Math.round(leadUs * speed) : leadUs;
   }
 }
